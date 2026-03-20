@@ -5,6 +5,7 @@ from typing import Any
 
 
 FUEL_KEY_PATTERN = re.compile(r"^fuel-(\d+)$")
+PHASE_FUEL_KEY_PATTERN = re.compile(r"^(auto|teleop)\.fuel-(\d+)$")
 
 
 def parse_number(value: Any) -> float:
@@ -35,13 +36,34 @@ def compute_total_fuel(entry: dict[str, Any]) -> int | float:
 	return int(total) if total.is_integer() else total
 
 
+def compute_phase_total_fuel(entry: dict[str, Any], phase: str) -> int | float:
+	total = 0.0
+
+	for key, value in entry.items():
+		match = PHASE_FUEL_KEY_PATTERN.match(key)
+		if not match:
+			continue
+
+		key_phase = match.group(1)
+		if key_phase != phase:
+			continue
+
+		fuel_value = int(match.group(2))
+		quantity = parse_number(value)
+		total += fuel_value * quantity
+
+	return int(total) if total.is_integer() else total
+
+
 def add_total_fuel(entries: list[dict[str, Any]]) -> None:
 	for entry in entries:
 		entry["total-fuel"] = compute_total_fuel(entry)
+		entry["auto.total_fuel"] = compute_phase_total_fuel(entry, "auto")
+		entry["teleop.total_fuel"] = compute_phase_total_fuel(entry, "teleop")
 
 
 def main() -> None:
-	data_path = Path(__file__).resolve().parent.parent / "data.json"
+	data_path = Path(__file__).resolve().parent.parent / "python-script/data.json"
 
 	with data_path.open("r", encoding="utf-8") as file:
 		data = json.load(file)
