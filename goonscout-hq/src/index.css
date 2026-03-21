@@ -43,5 +43,26 @@
     @apply min-h-screen bg-background text-foreground antialiased;
     background-image: radial-gradient(circle at 20% 10%, hsl(215 27% 14%) 0%, transparent 40%),
       radial-gradient(circle at 80% 80%, hsl(217 32% 12%) 0%, transparent 42%);
+    scrollbar-width: thin;
+    scrollbar-color: rgba(113, 113, 122, 0.72) rgba(24, 24, 27, 0.9);
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: rgba(24, 24, 27, 0.9);
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(113, 113, 122, 0.88), rgba(82, 82, 91, 0.88));
+    border-radius: 9999px;
+    border: 2px solid rgba(24, 24, 27, 0.9);
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, rgba(161, 161, 170, 0.95), rgba(113, 113, 122, 0.95));
   }
 }

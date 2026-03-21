@@ -1,851 +1,1762 @@
-import { FormEvent, Fragment, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import * as React from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
-import jsQR from "jsqr";
+import { BarChart3, FileJson, Folder, Home, Plus, Search, Settings, Upload } from "lucide-react";
+import { Bar, BarChart, CartesianGrid, Cell, LabelList, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import JsonViewerPage from "@/pages/JsonViewerPage";
 
-type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
-type JsonPath = Array<string | number>;
+type WorkspaceProject = {
+  id: string;
+  name: string;
+  folder_path: string;
+  json_file_path?: string | null;
+  updated_at: number;
+};
 
-type EditingState =
-  | {
-      mode: "value";
-      path: JsonPath;
-      draft: string;
-    }
-  | {
-      mode: "key";
-      path: JsonPath;
-      key: string;
-      draft: string;
+type WorkspaceOverview = {
+  root_path: string;
+  projects_path: string;
+  projects: WorkspaceProject[];
+};
+
+type ParsedRoute =
+  | { kind: "home" }
+  | { kind: "project"; projectId: string }
+  | { kind: "team"; projectId: string; team: string }
+  | { kind: "viewer"; projectId?: string };
+
+type ProjectSection = "overview" | "config" | "compare" | "picklist" | "scouts" | "teams" | "data";
+type JsonEntry = Record<string, unknown>;
+type TeamSeriesPoint = { match: number; value: number; scouter: string };
+type TeamChartPoint = { match: number; value: number | null; compareValue: number | null; scouter: string; compareScouter: string };
+type DataGraphType = "scatter" | "bar";
+
+function parseHashRoute(hashValue: string): ParsedRoute {
+  const hash = hashValue || "#/";
+
+  const pathOnly = hash.split("?")[0] ?? "#/";
+  const decodedPath = decodeURIComponent(pathOnly);
+  const teamMatch = decodedPath.match(/^#\/project\/([^/]+)\/team\/(.+)$/);
+
+  if (teamMatch) {
+    return {
+      kind: "team",
+      projectId: teamMatch[1],
+      team: teamMatch[2],
     };
-
-//test
-
-function pathEquals(left: JsonPath, right: JsonPath): boolean {
-  if (left.length !== right.length) {
-    return false;
   }
 
-  return left.every((segment, index) => segment === right[index]);
+  if (hash.startsWith("#/project/")) {
+    const projectId = decodeURIComponent(hash.replace("#/project/", ""));
+    if (projectId) {
+      return { kind: "project", projectId };
+    }
+  }
+
+  if (hash.startsWith("#/viewer")) {
+    const queryIndex = hash.indexOf("?");
+    const query = queryIndex >= 0 ? hash.slice(queryIndex + 1) : "";
+    const params = new URLSearchParams(query);
+
+    const projectIdValue = params.get("projectId") ?? undefined;
+
+    return {
+      kind: "viewer",
+      projectId: projectIdValue,
+    };
+  }
+
+  return { kind: "home" };
 }
 
-function getValueAtPath(root: JsonValue, path: JsonPath): JsonValue {
-  if (path.length === 0) {
-    return root;
-  }
-
-  const [head, ...rest] = path;
-
-  if (Array.isArray(root)) {
-    if (typeof head !== "number" || head < 0 || head >= root.length) {
-      throw new Error("Invalid array path.");
-    }
-
-    return getValueAtPath(root[head] as JsonValue, rest);
-  }
-
-  if (root !== null && typeof root === "object") {
-    if (typeof head !== "string" || !(head in root)) {
-      throw new Error("Invalid object path.");
-    }
-
-    return getValueAtPath((root as Record<string, JsonValue>)[head], rest);
-  }
-
-  throw new Error("Path does not target a JSON container.");
+function buildProjectHash(projectId: string): string {
+  return `#/project/${encodeURIComponent(projectId)}`;
 }
 
-function setValueAtPath(root: JsonValue, path: JsonPath, nextValue: JsonValue): JsonValue {
-  if (path.length === 0) {
-    return nextValue;
-  }
-
-  const [head, ...rest] = path;
-
-  if (Array.isArray(root)) {
-    if (typeof head !== "number" || head < 0 || head >= root.length) {
-      throw new Error("Invalid array path.");
-    }
-
-    const clone = [...root] as JsonValue[];
-    clone[head] = setValueAtPath(clone[head] as JsonValue, rest, nextValue);
-    return clone;
-  }
-
-  if (root !== null && typeof root === "object") {
-    if (typeof head !== "string" || !(head in root)) {
-      throw new Error("Invalid object path.");
-    }
-
-    const clone: Record<string, JsonValue> = { ...(root as Record<string, JsonValue>) };
-    clone[head] = setValueAtPath(clone[head], rest, nextValue);
-    return clone;
-  }
-
-  throw new Error("Path does not target a JSON container.");
+function buildTeamHash(projectId: string, team: string): string {
+  return `#/project/${encodeURIComponent(projectId)}/team/${encodeURIComponent(team)}`;
 }
 
-function renameKeyAtPath(root: JsonValue, path: JsonPath, oldKey: string, newKey: string): JsonValue {
-  const target = getValueAtPath(root, path);
+function buildViewerHash(project?: WorkspaceProject): string {
+  const params = new URLSearchParams();
 
-  if (target === null || Array.isArray(target) || typeof target !== "object") {
-    throw new Error("Target is not an object.");
+  if (project?.id) {
+    params.set("projectId", project.id);
   }
 
-  const objectTarget = target as Record<string, JsonValue>;
-
-  if (!(oldKey in objectTarget)) {
-    throw new Error("Original key was not found.");
-  }
-
-  if (oldKey !== newKey && newKey in objectTarget) {
-    throw new Error(`Key '${newKey}' already exists at this level.`);
-  }
-
-  const renamed: Record<string, JsonValue> = {};
-  for (const [key, value] of Object.entries(objectTarget)) {
-    renamed[key === oldKey ? newKey : key] = value;
-  }
-
-  return setValueAtPath(root, path, renamed);
+  const query = params.toString();
+  return query.length ? `#/viewer?${query}` : "#/viewer";
 }
 
-function deleteValueAtPath(root: JsonValue, path: JsonPath): JsonValue {
-  if (path.length === 0) {
-    throw new Error("Cannot delete the root JSON value.");
+function fromUnixSecondsToUpdatedLabel(timestamp: number): string {
+  if (!timestamp || Number.isNaN(timestamp)) {
+    return "Last edited: Unknown";
   }
 
-  const parentPath = path.slice(0, -1);
-  const targetKey = path[path.length - 1];
-  const parent = getValueAtPath(root, parentPath);
+  const then = new Date(timestamp * 1000);
+  const now = new Date();
+  const msInDay = 24 * 60 * 60 * 1000;
 
-  if (Array.isArray(parent)) {
-    if (typeof targetKey !== "number" || targetKey < 0 || targetKey >= parent.length) {
-      throw new Error("Invalid array entry path.");
-    }
+  const dayDiff = Math.floor(
+    (new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() -
+      new Date(then.getFullYear(), then.getMonth(), then.getDate()).getTime()) /
+      msInDay,
+  );
 
-    const clone = [...parent] as JsonValue[];
-    clone.splice(targetKey, 1);
-    return setValueAtPath(root, parentPath, clone);
+  if (dayDiff <= 0) {
+    return "Last edited: Today";
   }
 
-  if (parent !== null && typeof parent === "object") {
-    if (typeof targetKey !== "string" || !(targetKey in parent)) {
-      throw new Error("Invalid object entry path.");
-    }
-
-    const clone: Record<string, JsonValue> = { ...(parent as Record<string, JsonValue>) };
-    delete clone[targetKey];
-    return setValueAtPath(root, parentPath, clone);
+  if (dayDiff === 1) {
+    return "Last edited: Yesterday";
   }
 
-  throw new Error("Path does not target a removable JSON entry.");
+  return `Last edited: ${then.toLocaleString("en-US", { month: "short" })} ${then.getDate()}`;
 }
 
-function parseDraftValue(previousValue: JsonValue, draft: string): JsonValue {
-  if (typeof previousValue === "string") {
-    try {
-      return JSON.parse(draft) as JsonValue;
-    } catch {
-      return draft;
-    }
-  }
-
-  return JSON.parse(draft) as JsonValue;
-}
+const cardGradient =
+  "radial-gradient(circle at 20% 20%, rgba(59,130,246,0.16), transparent 42%), radial-gradient(circle at 80% 35%, rgba(30,64,175,0.25), transparent 45%), linear-gradient(180deg, rgba(15,23,42,0.9), rgba(10,15,32,0.95))";
 
 function App() {
-  const [path, setPath] = useState("");
-  const [jsonContent, setJsonContent] = useState("");
-  const [jsonData, setJsonData] = useState<JsonValue | null>(null);
-  const [status, setStatus] = useState("Set a JSON path and load it.");
-  const [isLoading, setIsLoading] = useState(false);
-  const [isSavingEdit, setIsSavingEdit] = useState(false);
-  const [isDeletingEntry, setIsDeletingEntry] = useState(false);
-  const [isScannerOpen, setIsScannerOpen] = useState(false);
-  const [isScanning, setIsScanning] = useState(false);
-  const [editing, setEditing] = useState<EditingState | null>(null);
-  const [pendingDeletePath, setPendingDeletePath] = useState<JsonPath | null>(null);
+  const [hashRoute, setHashRoute] = React.useState(window.location.hash || "#/");
+  const [workspace, setWorkspace] = React.useState<WorkspaceOverview | null>(null);
+  const [isLoadingWorkspace, setIsLoadingWorkspace] = React.useState(true);
+  const [workspaceError, setWorkspaceError] = React.useState("");
+  const [search, setSearch] = React.useState("");
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const scanFrameRef = useRef<number | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const scanLockedRef = useRef(false);
-  const isScanningRef = useRef(false);
+  const [isCreateDialogOpen, setIsCreateDialogOpen] = React.useState(false);
+  const [isCreatingProject, setIsCreatingProject] = React.useState(false);
+  const [createProjectName, setCreateProjectName] = React.useState("Untitled Project");
 
-  async function waitForVideoElement(timeoutMs = 2000): Promise<HTMLVideoElement> {
-    const deadline = Date.now() + timeoutMs;
+  const [projectSection, setProjectSection] = React.useState<ProjectSection>("overview");
+  const [teamSearch, setTeamSearch] = React.useState("");
+  const [teamNumbers, setTeamNumbers] = React.useState<string[]>([]);
+  const [selectedTeam, setSelectedTeam] = React.useState("");
+  const [scoutSearch, setScoutSearch] = React.useState("");
+  const [scoutNames, setScoutNames] = React.useState<string[]>([]);
+  const [selectedScout, setSelectedScout] = React.useState("");
+  const [jsonEntries, setJsonEntries] = React.useState<JsonEntry[]>([]);
+  const [selectedDataXTag, setSelectedDataXTag] = React.useState("");
+  const [selectedDataYTag, setSelectedDataYTag] = React.useState("");
+  const [selectedDataYTagSecondary, setSelectedDataYTagSecondary] = React.useState("");
+  const [activeDataAxis, setActiveDataAxis] = React.useState<"x" | "y" | "y2" | null>("x");
+  const [dataGraphType, setDataGraphType] = React.useState<DataGraphType>("scatter");
+  const [dataTeamSearch, setDataTeamSearch] = React.useState("");
+  const [dataTagSelectionError, setDataTagSelectionError] = React.useState("");
+  const [isDataGraphFullscreen, setIsDataGraphFullscreen] = React.useState(false);
+  const [teamTagOrder, setTeamTagOrder] = React.useState<string[]>([]);
+  const [selectedTeamTag, setSelectedTeamTag] = React.useState("");
+  const [compareTeamInput, setCompareTeamInput] = React.useState("");
+  const [isTeamGraphFullscreen, setIsTeamGraphFullscreen] = React.useState(false);
+  const [draggingTeamTag, setDraggingTeamTag] = React.useState<string | null>(null);
+  const [animatedChartData, setAnimatedChartData] = React.useState<TeamChartPoint[]>([]);
+  const [isLoadingIndex, setIsLoadingIndex] = React.useState(false);
+  const [indexError, setIndexError] = React.useState("");
 
-    while (Date.now() < deadline) {
-      if (videoRef.current) {
-        return videoRef.current;
-      }
+  React.useEffect(() => {
+    const onHashChange = () => {
+      setHashRoute(window.location.hash || "#/");
+    };
 
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
-      });
-    }
+    window.addEventListener("hashchange", onHashChange);
 
-    throw new Error("Video element is not available.");
-  }
-
-  async function attachStreamToVideo(stream: MediaStream) {
-    const video = await waitForVideoElement();
-
-    video.srcObject = stream;
-
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        cleanup();
-        reject(new Error("Timed out waiting for camera video frames."));
-      }, 4000);
-
-      const cleanup = () => {
-        window.clearTimeout(timeout);
-        video.onloadedmetadata = null;
-        video.oncanplay = null;
-      };
-
-      const tryPlay = async () => {
-        try {
-          await video.play();
-          cleanup();
-          resolve();
-        } catch (error) {
-          cleanup();
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      };
-
-      if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
-        void tryPlay();
-        return;
-      }
-
-      video.onloadedmetadata = () => {
-        void tryPlay();
-      };
-
-      video.oncanplay = () => {
-        void tryPlay();
-      };
-    });
-  }
-
-  function stopScanner() {
-    setIsScanning(false);
-    setIsScannerOpen(false);
-    isScanningRef.current = false;
-
-    if (scanFrameRef.current !== null) {
-      cancelAnimationFrame(scanFrameRef.current);
-      scanFrameRef.current = null;
-    }
-
-    if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.srcObject = null;
-    }
-
-    if (mediaStreamRef.current) {
-      for (const track of mediaStreamRef.current.getTracks()) {
-        track.stop();
-      }
-      mediaStreamRef.current = null;
-    }
-
-    scanLockedRef.current = false;
-  }
-
-  useEffect(() => {
     return () => {
-      stopScanner();
+      window.removeEventListener("hashchange", onHashChange);
     };
   }, []);
 
-  async function persistJson(nextData: JsonValue) {
-    const trimmedPath = path.trim();
-    if (!trimmedPath) {
-      throw new Error("Please provide a valid JSON file path.");
-    }
-
-    const prettyJson = JSON.stringify(nextData, null, 2);
-    await invoke("write_json_file", {
-      path: trimmedPath,
-      content: prettyJson,
-    });
-
-    setJsonData(nextData);
-    setJsonContent(prettyJson);
-  }
-
-  async function commitEdit() {
-    if (!editing || jsonData === null) {
-      return;
-    }
-
-    setIsSavingEdit(true);
+  const refreshWorkspace = React.useCallback(async () => {
+    setIsLoadingWorkspace(true);
 
     try {
-      if (editing.mode === "value") {
-        const previousValue = getValueAtPath(jsonData, editing.path);
-        const nextValue = parseDraftValue(previousValue, editing.draft);
-        const updatedData = setValueAtPath(jsonData, editing.path, nextValue);
-        await persistJson(updatedData);
-        setStatus("JSON saved.");
-      } else {
-        const trimmedKey = editing.draft.trim();
-        if (!trimmedKey) {
-          throw new Error("Key cannot be empty.");
-        }
-
-        const updatedData = renameKeyAtPath(jsonData, editing.path, editing.key, trimmedKey);
-        await persistJson(updatedData);
-        setStatus("JSON saved.");
-      }
-
-      setEditing(null);
+      const overview = await invoke<WorkspaceOverview>("get_goonhq_workspace_overview");
+      setWorkspace(overview);
+      setWorkspaceError("");
     } catch (error) {
-      setStatus(`Unable to save JSON: ${String(error)}`);
+      setWorkspaceError(`Unable to load local workspace: ${String(error)}`);
     } finally {
-      setIsSavingEdit(false);
+      setIsLoadingWorkspace(false);
     }
-  }
+  }, []);
 
-  function cancelEdit() {
-    if (!editing) {
-      return;
-    }
+  React.useEffect(() => {
+    void refreshWorkspace();
+  }, [refreshWorkspace]);
 
-    setEditing(null);
-    setStatus("Edit canceled.");
-  }
+  const route = React.useMemo(() => parseHashRoute(hashRoute), [hashRoute]);
 
-  function handleEditorKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      event.stopPropagation();
-      void commitEdit();
-    }
-
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      cancelEdit();
-    }
-  }
-
-  function renderEditableInput() {
-    if (!editing) {
+  const selectedProject = React.useMemo(() => {
+    if (!workspace) {
       return null;
     }
 
-    return (
-      <input
-        autoFocus
-        value={editing.draft}
-        onChange={(event) => setEditing({ ...editing, draft: event.currentTarget.value })}
-        onBlur={cancelEdit}
-        onKeyDown={handleEditorKeyDown}
-        className="h-7 min-w-24 rounded border border-ring bg-background px-2 text-xs text-foreground outline-none"
-      />
-    );
-  }
-
-  function renderValue(value: JsonValue, depth: number, currentPath: JsonPath): ReactNode {
-    const indent = "  ".repeat(depth);
-    const nextIndent = "  ".repeat(depth + 1);
-
-    if (Array.isArray(value)) {
-      if (value.length === 0) {
-        return <span className="text-slate-400">[]</span>;
-      }
-
-      return (
-        <>
-          <span className="text-slate-400">[</span>
-          {"\n"}
-          {value.map((item, index) => (
-            <Fragment key={`arr-${depth}-${index}`}>
-              {nextIndent}
-              <span
-                className="cursor-context-menu"
-                onContextMenu={(event) => {
-                  if (isSavingEdit || isDeletingEntry) {
-                    return;
-                  }
-
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setPendingDeletePath([...currentPath, index]);
-                }}
-                title="Right-click to delete this entry"
-              >
-                {renderValue(item, depth + 1, [...currentPath, index])}
-              </span>
-              {index < value.length - 1 ? <span className="text-slate-400">,</span> : null}
-              {"\n"}
-            </Fragment>
-          ))}
-          {indent}
-          <span className="text-slate-400">]</span>
-        </>
-      );
+    const projectId =
+      route.kind === "project"
+        ? route.projectId
+        : route.kind === "viewer"
+          ? route.projectId
+          : route.kind === "team"
+            ? route.projectId
+            : undefined;
+    if (!projectId) {
+      return null;
     }
 
-    if (value !== null && typeof value === "object") {
-      const entries = Object.entries(value);
+    return workspace.projects.find((project) => project.id === projectId) ?? null;
+  }, [route, workspace]);
 
-      if (entries.length === 0) {
-        return <span className="text-slate-400">{"{}"}</span>;
-      }
+  React.useEffect(() => {
+    setTeamSearch("");
+    setSelectedTeam("");
+    setScoutSearch("");
+    setSelectedScout("");
+    setIndexError("");
 
-      return (
-        <>
-          <span className="text-slate-400">{"{"}</span>
-          {"\n"}
-          {entries.map(([key, item], index) => {
-            const isEditingKey = editing?.mode === "key" && editing.key === key && pathEquals(editing.path, currentPath);
+    const needsIndexForProjectTabs = route.kind === "project" && (projectSection === "teams" || projectSection === "scouts" || projectSection === "data");
+    const needsIndexForTeamPage = route.kind === "team";
 
-            return (
-              <Fragment key={`obj-${depth}-${key}-${index}`}>
-                {nextIndent}
-                {isEditingKey ? (
-                  renderEditableInput()
-                ) : (
-                  <span
-                    className="cursor-text text-sky-300"
-                    onDoubleClick={() => {
-                      if (isSavingEdit) {
-                        return;
-                      }
-
-                      setEditing({
-                        mode: "key",
-                        path: currentPath,
-                        key,
-                        draft: key,
-                      });
-                      setStatus("Editing key. Press Enter to save or click away to cancel.");
-                    }}
-                  >
-                    {JSON.stringify(key)}
-                  </span>
-                )}
-                <span className="text-slate-400">: </span>
-                {renderValue(item as JsonValue, depth + 1, [...currentPath, key])}
-                {index < entries.length - 1 ? <span className="text-slate-400">,</span> : null}
-                {"\n"}
-              </Fragment>
-            );
-          })}
-          {indent}
-          <span className="text-slate-400">{"}"}</span>
-        </>
-      );
-    }
-
-    const isEditingValue = editing?.mode === "value" && pathEquals(editing.path, currentPath);
-    if (isEditingValue) {
-      return renderEditableInput();
-    }
-
-    if (typeof value === "string") {
-      return (
-        <span
-          className="cursor-text text-emerald-300"
-          onDoubleClick={() => {
-            if (isSavingEdit) {
-              return;
-            }
-
-            setEditing({
-              mode: "value",
-              path: currentPath,
-              draft: value,
-            });
-            setStatus("Editing value. Press Enter to save or click away to cancel.");
-          }}
-        >
-          {JSON.stringify(value)}
-        </span>
-      );
-    }
-
-    if (typeof value === "number") {
-      return (
-        <span
-          className="cursor-text text-amber-300"
-          onDoubleClick={() => {
-            if (isSavingEdit) {
-              return;
-            }
-
-            setEditing({
-              mode: "value",
-              path: currentPath,
-              draft: String(value),
-            });
-            setStatus("Editing value. Press Enter to save or click away to cancel.");
-          }}
-        >
-          {String(value)}
-        </span>
-      );
-    }
-
-    if (typeof value === "boolean") {
-      return (
-        <span
-          className="cursor-text text-orange-300"
-          onDoubleClick={() => {
-            if (isSavingEdit) {
-              return;
-            }
-
-            setEditing({
-              mode: "value",
-              path: currentPath,
-              draft: String(value),
-            });
-            setStatus("Editing value. Press Enter to save or click away to cancel.");
-          }}
-        >
-          {String(value)}
-        </span>
-      );
-    }
-
-    return (
-      <span
-        className="cursor-text text-rose-300"
-        onDoubleClick={() => {
-          if (isSavingEdit) {
-            return;
-          }
-
-          setEditing({
-            mode: "value",
-            path: currentPath,
-            draft: "null",
-          });
-          setStatus("Editing value. Press Enter to save or click away to cancel.");
-        }}
-      >
-        null
-      </span>
-    );
-  }
-
-  async function loadJsonFromPath(nextPath: string) {
-    const trimmedPath = nextPath.trim();
-    if (!trimmedPath) {
-      setStatus("Please provide a valid JSON file path.");
+    if (!needsIndexForProjectTabs && !needsIndexForTeamPage) {
       return;
     }
 
-    setIsLoading(true);
-    setStatus("Loading JSON file...");
-
-    try {
-      const formattedJson = await invoke<string>("read_json_file", { path: trimmedPath });
-      const parsed = JSON.parse(formattedJson) as JsonValue;
-      setJsonData(parsed);
-      setJsonContent(formattedJson);
-      setEditing(null);
-      setStatus("JSON loaded successfully.");
-    } catch (error) {
-      setJsonData(null);
-      setJsonContent("");
-      setEditing(null);
-      setStatus(`Unable to load JSON: ${String(error)}`);
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
-  async function handleLoad(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    await loadJsonFromPath(path);
-  }
-
-  async function handlePickFile() {
-    const selected = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-
-    if (typeof selected !== "string") {
-      setStatus("No file selected.");
+    if (!selectedProject?.json_file_path) {
+      setJsonEntries([]);
+      setTeamNumbers([]);
+      setScoutNames([]);
       return;
     }
 
-    setPath(selected);
-    await loadJsonFromPath(selected);
-  }
+    let isCancelled = false;
 
-  async function handleScannedQr(payload: string) {
-    if (scanLockedRef.current) {
-      return;
-    }
-
-    scanLockedRef.current = true;
-    stopScanner();
-
-    const trimmedPath = path.trim();
-    if (!trimmedPath) {
-      setStatus("Select a JSON path first before scanning.");
-      return;
-    }
-
-    try {
-      await invoke("append_json_entry", {
-        path: trimmedPath,
-        entryJson: payload,
-      });
-
-      await loadJsonFromPath(trimmedPath);
-      setStatus("QR JSON inserted at the top successfully.");
-    } catch (error) {
-      setStatus(`QR scan found data but append failed: ${String(error)}`);
-    }
-  }
-
-  async function confirmDeleteEntry() {
-    if (!pendingDeletePath || jsonData === null) {
-      return;
-    }
-
-    setIsDeletingEntry(true);
-
-    try {
-      const updatedData = deleteValueAtPath(jsonData, pendingDeletePath);
-      await persistJson(updatedData);
-      setPendingDeletePath(null);
-      setEditing(null);
-      setStatus("Entry deleted successfully.");
-    } catch (error) {
-      setStatus(`Unable to delete entry: ${String(error)}`);
-    } finally {
-      setIsDeletingEntry(false);
-    }
-  }
-
-  function scanVideoFrame() {
-    if (!videoRef.current || !canvasRef.current || !isScanningRef.current) {
-      return;
-    }
-
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const context = canvas.getContext("2d", { willReadFrequently: true });
-
-    if (!context) {
-      setStatus("Unable to access canvas context for scanning.");
-      stopScanner();
-      return;
-    }
-
-    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-      const code = jsQR(imageData.data, imageData.width, imageData.height);
-
-      if (code?.data) {
-        void handleScannedQr(code.data);
-      }
-    }
-
-    scanFrameRef.current = requestAnimationFrame(scanVideoFrame);
-  }
-
-  async function handleStartScanner() {
-    if (!path.trim()) {
-      setStatus("Please set a JSON file path before scanning.");
-      return;
-    }
-
-    if (isSavingEdit) {
-      setStatus("Finish or cancel the current edit before scanning.");
-      return;
-    }
-
-    try {
-      let stream: MediaStream;
+    const loadIndex = async () => {
+      setIsLoadingIndex(true);
 
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
+        const content = await invoke<string>("read_json_file", {
+          path: selectedProject.json_file_path,
         });
-      } catch {
-        // Fallback for webcams/drivers that don't like facingMode constraints.
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+
+        const parsed = JSON.parse(content) as unknown;
+        const rawEntries = Array.isArray(parsed)
+          ? parsed
+          : parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).data)
+            ? ((parsed as Record<string, unknown>).data as unknown[])
+            : [];
+
+        const entries = rawEntries
+          .filter((entry): entry is JsonEntry => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry));
+
+        const uniqueTeams = new Set<string>();
+        const uniqueScouts = new Set<string>();
+
+        for (const entry of entries) {
+          const teamValue = entry.team;
+          if (typeof teamValue === "string" && teamValue.trim()) {
+            uniqueTeams.add(teamValue.trim());
+          } else if (typeof teamValue === "number") {
+            uniqueTeams.add(String(teamValue));
+          }
+
+          const scoutValue = entry.scouter;
+          if (typeof scoutValue === "string" && scoutValue.trim()) {
+            uniqueScouts.add(scoutValue.trim());
+          }
+        }
+
+        if (!isCancelled) {
+          setJsonEntries(entries);
+          setTeamNumbers(Array.from(uniqueTeams).sort((left, right) => left.localeCompare(right, undefined, { numeric: true })));
+          setScoutNames(Array.from(uniqueScouts).sort((left, right) => left.localeCompare(right)));
+          setIndexError("");
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setJsonEntries([]);
+          setTeamNumbers([]);
+          setScoutNames([]);
+          setIndexError(`Unable to read teams/scouts from JSON: ${String(error)}`);
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingIndex(false);
+        }
+      }
+    };
+
+    void loadIndex();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [projectSection, route.kind, selectedProject?.json_file_path]);
+
+  const filteredTeamNumbers = React.useMemo(() => {
+    const term = teamSearch.trim().toLowerCase();
+    if (!term) {
+      return teamNumbers;
+    }
+
+    return teamNumbers.filter((team) => team.toLowerCase().includes(term));
+  }, [teamNumbers, teamSearch]);
+
+  const filteredScoutNames = React.useMemo(() => {
+    const term = scoutSearch.trim().toLowerCase();
+    if (!term) {
+      return scoutNames;
+    }
+
+    return scoutNames.filter((scout) => scout.toLowerCase().includes(term));
+  }, [scoutNames, scoutSearch]);
+
+  const activeTeam = route.kind === "team" ? route.team : "";
+  const statsTeam = route.kind === "team" ? activeTeam : selectedTeam;
+  const excludedDataTags = React.useMemo(() => new Set(["team", "match", "scouter", "scouters"]), []);
+
+  const allNumericTags = React.useMemo(() => {
+    const tags = new Set<string>();
+
+    for (const entry of jsonEntries) {
+      for (const [tag, value] of Object.entries(entry)) {
+        if (excludedDataTags.has(tag) || typeof value === "boolean") {
+          continue;
+        }
+
+        if (typeof value === "number" && Number.isFinite(value)) {
+          tags.add(tag);
+          continue;
+        }
+
+        if (typeof value === "string" && value.trim() !== "") {
+          const parsed = Number(value);
+          if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
+            tags.add(tag);
+          }
+        }
+      }
+    }
+
+    return Array.from(tags).sort((left, right) => left.localeCompare(right));
+  }, [excludedDataTags, jsonEntries]);
+
+  React.useEffect(() => {
+    setSelectedDataXTag((previous) => {
+      if (previous && allNumericTags.includes(previous)) {
+        return previous;
+      }
+      return allNumericTags[0] ?? "";
+    });
+
+    setSelectedDataYTag((previous) => {
+      if (previous && allNumericTags.includes(previous)) {
+        return previous;
+      }
+      if (allNumericTags.length >= 2) {
+        return allNumericTags[1];
+      }
+      return allNumericTags[0] ?? "";
+    });
+  }, [allNumericTags]);
+
+  const extractNumericValue = React.useCallback((entry: JsonEntry, tag: string) => {
+    const raw = entry[tag];
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      return raw;
+    }
+    if (typeof raw === "string" && raw.trim() !== "") {
+      const parsed = Number(raw);
+      if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return null;
+  }, []);
+
+  const parseAutoTeleopTag = React.useCallback((tag: string) => {
+    if (tag.startsWith("auto.")) {
+      return { phase: "auto" as const, base: tag.slice("auto.".length) };
+    }
+    if (tag.startsWith("teleop.")) {
+      return { phase: "teleop" as const, base: tag.slice("teleop.".length) };
+    }
+    return null;
+  }, []);
+
+  const isAutoTeleopPair = React.useCallback(
+    (firstTag: string, secondTag: string) => {
+      const first = parseAutoTeleopTag(firstTag);
+      const second = parseAutoTeleopTag(secondTag);
+
+      if (!first || !second) {
+        return false;
       }
 
-      mediaStreamRef.current = stream;
-      setIsScannerOpen(true);
-      setIsScanning(true);
-      isScanningRef.current = true;
-      setStatus("Scanner active. Point your camera at a QR code.");
+      return first.base === second.base && first.phase !== second.phase;
+    },
+    [parseAutoTeleopTag],
+  );
 
-      await attachStreamToVideo(stream);
-
-      scanFrameRef.current = requestAnimationFrame(scanVideoFrame);
-    } catch (error) {
-      stopScanner();
-      setStatus(`Unable to start camera scanner: ${String(error)}`);
+  const dataScatterRows = React.useMemo(() => {
+    if (!selectedDataXTag || !selectedDataYTag) {
+      return [] as Array<{ x: number; y: number; team: string; matches: number }>;
     }
+
+    const grouped = new Map<string, { xSum: number; xCount: number; ySum: number; yCount: number; matches: number }>();
+
+    for (const entry of jsonEntries) {
+      const x = extractNumericValue(entry, selectedDataXTag);
+      const y = extractNumericValue(entry, selectedDataYTag);
+
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "Unknown";
+      if (!team) {
+        continue;
+      }
+
+      const current = grouped.get(team) ?? { xSum: 0, xCount: 0, ySum: 0, yCount: 0, matches: 0 };
+      current.matches += 1;
+
+      if (x !== null) {
+        current.xSum += x;
+        current.xCount += 1;
+      }
+
+      if (y !== null) {
+        current.ySum += y;
+        current.yCount += 1;
+      }
+
+      grouped.set(team, current);
+    }
+
+    return Array.from(grouped.entries())
+      .filter(([, stats]) => stats.xCount > 0 && stats.yCount > 0)
+      .map(([team, stats]) => ({
+        team,
+        x: stats.xSum / stats.xCount,
+        y: stats.ySum / stats.yCount,
+        matches: stats.matches,
+      }))
+      .sort((left, right) => right.y - left.y);
+  }, [extractNumericValue, jsonEntries, selectedDataXTag, selectedDataYTag]);
+
+  const dataBarRows = React.useMemo(() => {
+    if (!selectedDataYTag) {
+      return [] as Array<{ team: string; primaryValue: number; secondaryValue: number; totalValue: number }>;
+    }
+
+    const grouped = new Map<string, { primarySum: number; primaryCount: number; secondarySum: number; secondaryCount: number }>();
+
+    for (const entry of jsonEntries) {
+      const primaryValue = extractNumericValue(entry, selectedDataYTag);
+      const secondaryValue = selectedDataYTagSecondary ? extractNumericValue(entry, selectedDataYTagSecondary) : null;
+
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "Unknown";
+      if (!team) {
+        continue;
+      }
+
+      const current = grouped.get(team) ?? { primarySum: 0, primaryCount: 0, secondarySum: 0, secondaryCount: 0 };
+
+      if (primaryValue !== null) {
+        current.primarySum += primaryValue;
+        current.primaryCount += 1;
+      }
+
+      if (secondaryValue !== null) {
+        current.secondarySum += secondaryValue;
+        current.secondaryCount += 1;
+      }
+
+      grouped.set(team, current);
+    }
+
+    return Array.from(grouped.entries())
+      .map(([team, stats]) => {
+        const primaryAverage = stats.primaryCount > 0 ? stats.primarySum / stats.primaryCount : 0;
+        const secondaryAverage = selectedDataYTagSecondary
+          ? stats.secondaryCount > 0
+            ? stats.secondarySum / stats.secondaryCount
+            : 0
+          : 0;
+
+        return {
+          team,
+          primaryValue: primaryAverage,
+          secondaryValue: secondaryAverage,
+          totalValue: primaryAverage + secondaryAverage,
+        };
+      })
+      .sort((left, right) => right.totalValue - left.totalValue);
+  }, [extractNumericValue, jsonEntries, selectedDataYTag, selectedDataYTagSecondary]);
+
+  const teamAverages = React.useMemo(() => {
+    if (!statsTeam) {
+      return [] as Array<{ tag: string; average: number }>;
+    }
+
+    const relevantEntries = jsonEntries.filter((entry) => {
+      const value = entry.team;
+      return typeof value === "string" ? value.trim() === statsTeam : typeof value === "number" ? String(value) === statsTeam : false;
+    });
+
+    const totals = new Map<string, { sum: number; count: number }>();
+    const excludedTags = excludedDataTags;
+
+    for (const entry of relevantEntries) {
+      for (const [tag, value] of Object.entries(entry)) {
+        if (excludedTags.has(tag)) {
+          continue;
+        }
+
+        if (typeof value === "boolean") {
+          continue;
+        }
+
+        let numericValue: number | null = null;
+
+        if (typeof value === "number" && Number.isFinite(value)) {
+          numericValue = value;
+        } else if (typeof value === "string" && value.trim() !== "") {
+          const parsed = Number(value);
+          if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
+            numericValue = parsed;
+          }
+        }
+
+        if (numericValue === null) {
+          continue;
+        }
+
+        const current = totals.get(tag) ?? { sum: 0, count: 0 };
+        current.sum += numericValue;
+        current.count += 1;
+        totals.set(tag, current);
+      }
+    }
+
+    return Array.from(totals.entries())
+      .map(([tag, stats]) => ({
+        tag,
+        average: stats.count > 0 ? stats.sum / stats.count : 0,
+      }))
+      .sort((left, right) => left.tag.localeCompare(right.tag));
+  }, [excludedDataTags, jsonEntries, statsTeam]);
+
+  const selectedTeamMatchCount = React.useMemo(() => {
+    if (!statsTeam) {
+      return 0;
+    }
+
+    return jsonEntries.filter((entry) => {
+      const value = entry.team;
+      return typeof value === "string" ? value.trim() === statsTeam : typeof value === "number" ? String(value) === statsTeam : false;
+    }).length;
+  }, [jsonEntries, statsTeam]);
+
+  const buildTeamSeriesByTag = React.useCallback(
+    (team: string) => {
+      const series = new Map<string, TeamSeriesPoint[]>();
+      if (!team) {
+        return series;
+      }
+
+      const relevantEntries = jsonEntries.filter((entry) => {
+        const value = entry.team;
+        return typeof value === "string" ? value.trim() === team : typeof value === "number" ? String(value) === team : false;
+      });
+
+      for (let index = 0; index < relevantEntries.length; index += 1) {
+        const entry = relevantEntries[index];
+        const rawMatch = entry.match;
+        let matchNumber = index + 1;
+
+        if (typeof rawMatch === "number" && Number.isFinite(rawMatch)) {
+          matchNumber = rawMatch;
+        } else if (typeof rawMatch === "string" && rawMatch.trim() !== "") {
+          const parsedMatch = Number(rawMatch);
+          if (!Number.isNaN(parsedMatch) && Number.isFinite(parsedMatch)) {
+            matchNumber = parsedMatch;
+          }
+        }
+
+        const scouterValue = entry.scouter;
+        const scouterName = typeof scouterValue === "string" && scouterValue.trim() ? scouterValue.trim() : "Unknown";
+
+        for (const [tag, value] of Object.entries(entry)) {
+          if (excludedDataTags.has(tag) || typeof value === "boolean") {
+            continue;
+          }
+
+          let numericValue: number | null = null;
+
+          if (typeof value === "number" && Number.isFinite(value)) {
+            numericValue = value;
+          } else if (typeof value === "string" && value.trim() !== "") {
+            const parsedValue = Number(value);
+            if (!Number.isNaN(parsedValue) && Number.isFinite(parsedValue)) {
+              numericValue = parsedValue;
+            }
+          }
+
+          if (numericValue === null) {
+            continue;
+          }
+
+          const points = series.get(tag) ?? [];
+          points.push({ match: matchNumber, value: numericValue, scouter: scouterName });
+          series.set(tag, points);
+        }
+      }
+
+      for (const [tag, points] of series.entries()) {
+        points.sort((left, right) => left.match - right.match);
+        series.set(tag, points);
+      }
+
+      return series;
+    },
+    [excludedDataTags, jsonEntries],
+  );
+
+  const teamSeriesByTag = React.useMemo(() => {
+    return buildTeamSeriesByTag(activeTeam);
+  }, [activeTeam, buildTeamSeriesByTag]);
+
+  const availableTeamTags = React.useMemo(() => {
+    return Array.from(teamSeriesByTag.keys()).sort((left, right) => left.localeCompare(right));
+  }, [teamSeriesByTag]);
+
+  React.useEffect(() => {
+    setTeamTagOrder((previous) => {
+      const present = previous.filter((tag) => availableTeamTags.includes(tag));
+      const additions = availableTeamTags.filter((tag) => !present.includes(tag));
+      return [...present, ...additions];
+    });
+
+    setSelectedTeamTag((previous) => {
+      if (previous && availableTeamTags.includes(previous)) {
+        return previous;
+      }
+      return availableTeamTags[0] ?? "";
+    });
+  }, [availableTeamTags]);
+
+  const orderedTeamTags = React.useMemo(() => {
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+
+    for (const tag of teamTagOrder) {
+      if (availableTeamTags.includes(tag) && !seen.has(tag)) {
+        seen.add(tag);
+        ordered.push(tag);
+      }
+    }
+
+    for (const tag of availableTeamTags) {
+      if (!seen.has(tag)) {
+        ordered.push(tag);
+      }
+    }
+
+    return ordered;
+  }, [availableTeamTags, teamTagOrder]);
+
+  const selectedTeamSeries = React.useMemo(() => {
+    if (!selectedTeamTag) {
+      return [] as TeamSeriesPoint[];
+    }
+
+    return teamSeriesByTag.get(selectedTeamTag) ?? [];
+  }, [selectedTeamTag, teamSeriesByTag]);
+
+  const compareTeam = React.useMemo(() => compareTeamInput.trim(), [compareTeamInput]);
+
+  const compareTeamSeriesByTag = React.useMemo(() => {
+    if (!compareTeam || compareTeam === activeTeam) {
+      return new Map<string, TeamSeriesPoint[]>();
+    }
+    return buildTeamSeriesByTag(compareTeam);
+  }, [activeTeam, buildTeamSeriesByTag, compareTeam]);
+
+  const selectedCompareSeries = React.useMemo(() => {
+    if (!selectedTeamTag) {
+      return [] as TeamSeriesPoint[];
+    }
+    return compareTeamSeriesByTag.get(selectedTeamTag) ?? [];
+  }, [compareTeamSeriesByTag, selectedTeamTag]);
+
+  const targetChartData = React.useMemo(() => {
+    const byMatch = new Map<number, TeamChartPoint>();
+
+    for (const point of selectedTeamSeries) {
+      byMatch.set(point.match, {
+        match: point.match,
+        value: point.value,
+        compareValue: null,
+        scouter: point.scouter,
+        compareScouter: "",
+      });
+    }
+
+    for (const point of selectedCompareSeries) {
+      const existing = byMatch.get(point.match);
+      if (existing) {
+        existing.compareValue = point.value;
+        existing.compareScouter = point.scouter;
+        byMatch.set(point.match, existing);
+      } else {
+        byMatch.set(point.match, {
+          match: point.match,
+          value: null,
+          compareValue: point.value,
+          scouter: "",
+          compareScouter: point.scouter,
+        });
+      }
+    }
+
+    return Array.from(byMatch.values()).sort((left, right) => left.match - right.match);
+  }, [selectedCompareSeries, selectedTeamSeries]);
+
+  React.useEffect(() => {
+    if (targetChartData.length === 0) {
+      setAnimatedChartData([]);
+      return;
+    }
+
+    const baseline = targetChartData.map((point) => ({
+      match: point.match,
+      value: typeof point.value === "number" ? 0 : null,
+      compareValue: typeof point.compareValue === "number" ? 0 : null,
+      scouter: point.scouter,
+      compareScouter: point.compareScouter,
+    }));
+    setAnimatedChartData(baseline);
+
+    const frame = window.requestAnimationFrame(() => {
+      setAnimatedChartData(targetChartData);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+    };
+  }, [targetChartData]);
+
+  React.useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    if (isTeamGraphFullscreen || isDataGraphFullscreen) {
+      document.body.style.overflow = "hidden";
+    }
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [isDataGraphFullscreen, isTeamGraphFullscreen]);
+
+  React.useEffect(() => {
+    if (dataGraphType === "bar") {
+      setActiveDataAxis("y");
+    }
+  }, [dataGraphType]);
+
+  React.useEffect(() => {
+    if (!selectedDataYTagSecondary) {
+      return;
+    }
+
+    if (!allNumericTags.includes(selectedDataYTagSecondary)) {
+      setSelectedDataYTagSecondary("");
+      return;
+    }
+
+    if (!isAutoTeleopPair(selectedDataYTag, selectedDataYTagSecondary)) {
+      setSelectedDataYTagSecondary("");
+    }
+  }, [allNumericTags, isAutoTeleopPair, selectedDataYTag, selectedDataYTagSecondary]);
+
+  const normalizedDataTeamSearch = React.useMemo(() => dataTeamSearch.trim().toLowerCase(), [dataTeamSearch]);
+
+  const highlightedScatterRows = React.useMemo(() => {
+    if (!normalizedDataTeamSearch) {
+      return [] as typeof dataScatterRows;
+    }
+    return dataScatterRows.filter((row) => row.team.toLowerCase().includes(normalizedDataTeamSearch));
+  }, [dataScatterRows, normalizedDataTeamSearch]);
+
+  const regularScatterRows = React.useMemo(() => {
+    if (!normalizedDataTeamSearch) {
+      return dataScatterRows;
+    }
+    return dataScatterRows.filter((row) => !row.team.toLowerCase().includes(normalizedDataTeamSearch));
+  }, [dataScatterRows, normalizedDataTeamSearch]);
+
+  const highlightedBarTeams = React.useMemo(() => {
+    if (!normalizedDataTeamSearch) {
+      return new Set<string>();
+    }
+    return new Set(dataBarRows.filter((row) => row.team.toLowerCase().includes(normalizedDataTeamSearch)).map((row) => row.team));
+  }, [dataBarRows, normalizedDataTeamSearch]);
+
+  const foundScatterTeam = React.useMemo(() => {
+    if (!normalizedDataTeamSearch) {
+      return null;
+    }
+    return highlightedScatterRows[0] ?? null;
+  }, [highlightedScatterRows, normalizedDataTeamSearch]);
+
+  const foundBarTeamIndex = React.useMemo(() => {
+    if (!normalizedDataTeamSearch) {
+      return -1;
+    }
+    return dataBarRows.findIndex((row) => row.team.toLowerCase().includes(normalizedDataTeamSearch));
+  }, [dataBarRows, normalizedDataTeamSearch]);
+
+  const moveTeamTag = React.useCallback((fromTag: string, toTag: string) => {
+    if (fromTag === toTag) {
+      return;
+    }
+
+    setTeamTagOrder((previous) => {
+      const next = [...previous];
+      const fromIndex = next.indexOf(fromTag);
+      const toIndex = next.indexOf(toTag);
+
+      if (fromIndex < 0 || toIndex < 0) {
+        return previous;
+      }
+
+      next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, fromTag);
+      return next;
+    });
+  }, []);
+
+  const displayedProjects = React.useMemo(() => {
+    if (!workspace) {
+      return [];
+    }
+
+    const term = search.trim().toLowerCase();
+    if (!term) {
+      return workspace.projects;
+    }
+
+    return workspace.projects.filter((project) => project.name.toLowerCase().includes(term));
+  }, [search, workspace]);
+
+  const navigateHome = React.useCallback(() => {
+    window.location.hash = "#/";
+  }, []);
+
+  const navigateProject = React.useCallback((projectId: string) => {
+    window.location.hash = buildProjectHash(projectId);
+  }, []);
+
+  const navigateTeam = React.useCallback((projectId: string, team: string) => {
+    window.location.hash = buildTeamHash(projectId, team);
+  }, []);
+
+  const navigateViewer = React.useCallback((project?: WorkspaceProject) => {
+    window.location.hash = buildViewerHash(project);
+  }, []);
+
+  const handleCreateProject = React.useCallback(async () => {
+    const name = createProjectName.trim();
+    if (!name) {
+      setWorkspaceError("Project name is required.");
+      return;
+    }
+
+    setIsCreatingProject(true);
+
+    try {
+      const project = await invoke<WorkspaceProject>("create_goonhq_project", { name });
+      await refreshWorkspace();
+      setIsCreateDialogOpen(false);
+      window.location.hash = buildProjectHash(project.id);
+    } catch (error) {
+      setWorkspaceError(`Could not create project: ${String(error)}`);
+    } finally {
+      setIsCreatingProject(false);
+    }
+  }, [createProjectName, refreshWorkspace]);
+
+  const viewerPath = route.kind === "viewer" ? selectedProject?.json_file_path ?? "" : "";
+
+  if (route.kind === "viewer") {
+    return (
+      <div className="min-h-screen bg-slate-900 text-white">
+        <header className="flex items-center justify-between border-b border-white/10 bg-slate-900 px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="text-4xl font-black tracking-tight text-white">GoonHQ</div>
+            <Button type="button" variant="secondary" size="sm" onClick={navigateHome}>
+              <Home className="mr-2 h-4 w-4" />
+              Home
+            </Button>
+            {selectedProject ? (
+              <Button type="button" variant="outline" size="sm" onClick={() => navigateProject(selectedProject.id)}>
+                <Folder className="mr-2 h-4 w-4" />
+                {selectedProject.name}
+              </Button>
+            ) : null}
+          </div>
+          <div className="text-sm text-white/65">JSON Viewer</div>
+        </header>
+
+        <JsonViewerPage initialPath={viewerPath} projectId={selectedProject?.id ?? route.projectId} />
+      </div>
+    );
   }
 
-  return (
-    <main className="mx-auto flex min-h-screen w-full max-w-4xl items-center px-4 py-10 md:px-8">
-      <Card className="w-full bg-card/90 backdrop-blur">
-        <CardHeader>
-          <CardTitle>GoonScout HQ JSON Viewer</CardTitle>
-          <CardDescription>Enter an absolute path to a JSON file and render its contents.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleLoad} className="space-y-6">
-            <div className="space-y-2">
-              <Label htmlFor="json-path">JSON file path</Label>
-              <div className="flex flex-col gap-2 md:flex-row">
-                <Input
-                  id="json-path"
-                  value={path}
-                  onChange={(event) => setPath(event.currentTarget.value)}
-                  placeholder="C:\\data\\example.json"
-                  autoComplete="off"
-                />
-                <Button type="button" variant="outline" onClick={handlePickFile} disabled={isLoading || isSavingEdit}>
-                  Browse...
-                </Button>
-              </div>
-            </div>
-
-            <div className="flex gap-3">
-              <Button type="submit" disabled={isLoading || isSavingEdit}>
-                {isLoading ? "Loading..." : "Load JSON"}
-              </Button>
+  if (route.kind === "team") {
+    return (
+      <div className="min-h-screen bg-slate-900 text-white">
+        <header className="flex items-center justify-between border-b border-white/10 bg-slate-900 px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="text-4xl font-black tracking-tight text-white">GoonHQ</div>
+            <Button type="button" variant="secondary" size="sm" onClick={navigateHome}>
+              <Home className="mr-2 h-4 w-4" />
+              Home
+            </Button>
+            {selectedProject ? (
               <Button
                 type="button"
                 variant="outline"
-                disabled={isLoading || isSavingEdit || isDeletingEntry || isScanning}
-                onClick={handleStartScanner}
-              >
-                {isScanning ? "Scanning..." : "Scan QR"}
-              </Button>
-              <Button
-                type="button"
-                variant="secondary"
-                disabled={isSavingEdit || isDeletingEntry}
+                size="sm"
                 onClick={() => {
-                  setEditing(null);
-                  setPendingDeletePath(null);
-                  setJsonData(null);
-                  setJsonContent("");
-                  setStatus("Viewer reset.");
+                  setProjectSection("teams");
+                  navigateProject(selectedProject.id);
                 }}
               >
-                Clear
+                <Folder className="mr-2 h-4 w-4" />
+                {selectedProject.name}
               </Button>
-            </div>
-
-            <p className="text-sm text-muted-foreground">{status}</p>
-
-            {isScannerOpen ? (
-              <div className="fixed inset-0 z-50 bg-black">
-                <video
-                  id="qr-scanner-video"
-                  ref={videoRef}
-                  className="h-full w-full object-cover"
-                  playsInline
-                  autoPlay
-                  muted
-                />
-                <div className="pointer-events-none absolute inset-x-0 top-0 bg-gradient-to-b from-black/80 to-transparent p-4">
-                  <p className="text-sm font-medium text-white">QR Scanner</p>
-                  <p className="text-xs text-slate-200">Align the code inside your camera view.</p>
-                </div>
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-4 sm:p-8">
-                  <div className="h-[min(78vw,78vh)] w-[min(78vw,78vh)] max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] rounded-2xl border-4 border-white/85 shadow-[0_0_0_9999px_rgba(0,0,0,0.45)] sm:max-h-[calc(100vh-4rem)] sm:max-w-[calc(100vw-4rem)]" />
-                </div>
-                <div className="absolute inset-x-0 bottom-0 flex justify-center p-5">
-                  <Button type="button" variant="secondary" onClick={stopScanner}>
-                    Stop Scanner
-                  </Button>
-                </div>
-                <canvas ref={canvasRef} className="hidden" />
-              </div>
             ) : null}
+          </div>
+          <div className="text-sm text-white/65">Team Details</div>
+        </header>
 
-            <div className="space-y-2">
-              <Label htmlFor="json-content">JSON content</Label>
-              <div
-                id="json-content"
-                className="min-h-64 w-full overflow-auto rounded-md border border-input bg-background px-3 py-2"
-              >
-                <pre className="font-mono text-sm leading-6">
-                  {jsonData !== null ? (
-                    renderValue(jsonData, 0, [])
-                  ) : jsonContent.trim() ? (
-                    <span className="text-foreground">{jsonContent}</span>
-                  ) : (
-                    <span className="text-muted-foreground">No JSON loaded yet.</span>
-                  )}
-                </pre>
-              </div>
-            </div>
-
-            <Dialog
-              open={pendingDeletePath !== null}
-              onOpenChange={(openState) => {
-                if (!openState && !isDeletingEntry) {
-                  setPendingDeletePath(null);
-                }
-              }}
+        <main className="p-4 md:p-6">
+          {!selectedProject ? (
+            <div className="rounded-xl border border-white/10 bg-slate-900/40 px-4 py-8 text-sm text-white/70">Project not found.</div>
+          ) : (
+            <div
+              className={`space-y-4 rounded-2xl border border-white/10 bg-slate-950/60 p-4 md:p-6 ${
+                isTeamGraphFullscreen ? "" : "backdrop-blur"
+              }`}
             >
-              <DialogContent>
-                <DialogHeader>
-                  <DialogTitle>Delete entry?</DialogTitle>
-                  <DialogDescription>
-                    This will permanently remove the selected JSON entry from the file. This action cannot be undone.
-                  </DialogDescription>
-                </DialogHeader>
-                <DialogFooter>
+              <h1 className="text-3xl font-semibold tracking-tight">
+                Team <span className="text-white">{activeTeam}</span>
+              </h1>
+              <p className="text-white/75">
+                Project: <span className="font-semibold text-white">{selectedProject.name}</span> • Matches: {selectedTeamMatchCount}
+              </p>
+
+              {isLoadingIndex ? (
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">Loading team stats...</div>
+              ) : indexError ? (
+                <p className="text-sm text-red-300">{indexError}</p>
+              ) : teamAverages.length === 0 ? (
+                <p className="text-sm text-white/60">No numeric tags available for averages.</p>
+              ) : (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  {teamAverages.map((item) => (
+                    <div key={item.tag} className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                      <p className="text-xs uppercase tracking-wide text-white/55">{item.tag}</p>
+                      <p className="mt-2 text-2xl font-semibold text-white">{item.average.toFixed(2)}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className={isTeamGraphFullscreen ? "fixed inset-0 z-[200] overflow-y-auto bg-slate-950 p-4 md:p-6" : ""}>
+                <div className="mb-3 flex items-center justify-end">
                   <Button
                     type="button"
                     variant="outline"
-                    onClick={() => setPendingDeletePath(null)}
-                    disabled={isDeletingEntry}
+                    className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800"
+                    onClick={() => setIsTeamGraphFullscreen((current) => !current)}
                   >
-                    Cancel
+                    {isTeamGraphFullscreen ? "Exit Full Screen" : "Full Screen"}
                   </Button>
-                  <Button type="button" variant="destructive" onClick={confirmDeleteEntry} disabled={isDeletingEntry}>
-                    {isDeletingEntry ? "Deleting..." : "Delete"}
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-          </form>
-        </CardContent>
-      </Card>
-    </main>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+                <aside className="rounded-xl border border-white/10 bg-slate-900/50 p-3 xl:col-span-3">
+                  <p className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-white/55">Data Tags</p>
+                  <p className="mb-3 text-xs text-white/50">Click a tag to graph it. Drag to reorder.</p>
+
+                  {orderedTeamTags.length === 0 ? (
+                    <p className="text-sm text-white/60">No numeric tags available.</p>
+                  ) : (
+                    <div className="space-y-2">
+                      {orderedTeamTags.map((tag) => {
+                        const selected = selectedTeamTag === tag;
+                        return (
+                          <button
+                            key={tag}
+                            type="button"
+                            draggable
+                            onDragStart={() => setDraggingTeamTag(tag)}
+                            onDragOver={(event) => {
+                              event.preventDefault();
+                            }}
+                            onDrop={(event) => {
+                              event.preventDefault();
+                              if (draggingTeamTag) {
+                                moveTeamTag(draggingTeamTag, tag);
+                              }
+                              setDraggingTeamTag(null);
+                            }}
+                            onDragEnd={() => setDraggingTeamTag(null)}
+                            onClick={() => setSelectedTeamTag(tag)}
+                            className={`w-full rounded-lg border px-3 py-2 text-left text-sm font-medium transition ${
+                              selected
+                                ? "border-blue-400/70 bg-blue-600/20 text-white"
+                                : "border-white/15 bg-slate-900/70 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
+                            }`}
+                          >
+                            {tag}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </aside>
+
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4 xl:col-span-9">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm text-white/75">
+                        Match vs <span className="font-semibold text-white">{selectedTeamTag || "Tag"}</span>
+                      </p>
+                      <p className="text-xs text-white/50">X: Match • Y: Selected Tag Value</p>
+                      {compareTeam && compareTeam !== activeTeam ? (
+                        <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-white/70">
+                          <div className="flex items-center gap-2">
+                            <span className="inline-block h-2.5 w-2.5 rounded-full bg-blue-400" />
+                            <span>Team {activeTeam}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />
+                            <span>Team {compareTeam}</span>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs text-white/60">Compare team</p>
+                      <Input
+                        value={compareTeamInput}
+                        onChange={(event) => setCompareTeamInput(event.currentTarget.value)}
+                        placeholder="Team #"
+                        className="h-9 w-32 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                      />
+                    </div>
+                  </div>
+
+                  {selectedTeamTag && animatedChartData.length > 0 ? (
+                    <div className={isTeamGraphFullscreen ? "h-[calc(100dvh-280px)] min-h-[260px] w-full" : "h-[420px] w-full"}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={animatedChartData} margin={{ top: 12, right: 20, left: 0, bottom: 8 }}>
+                          <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
+                          <XAxis
+                            dataKey="match"
+                            type="number"
+                            domain={["dataMin", "dataMax"]}
+                            tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
+                            allowDecimals={false}
+                          />
+                          <YAxis
+                            type="number"
+                            domain={["auto", "auto"]}
+                            tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
+                            width={60}
+                          />
+                          <Tooltip
+                            contentStyle={{
+                              backgroundColor: "rgba(2,6,23,0.95)",
+                              border: "1px solid rgba(255,255,255,0.15)",
+                              borderRadius: "0.75rem",
+                              color: "white",
+                            }}
+                            formatter={(value, name, item) => {
+                              const numeric = typeof value === "number" ? value : Number(value);
+                              const entry = item.payload as TeamChartPoint;
+                              const tagLabel = name === "compareValue" ? `${selectedTeamTag} (Compare)` : selectedTeamTag;
+                              const scouter = name === "compareValue" ? entry.compareScouter || "Unknown" : entry.scouter || "Unknown";
+                              const valueLabel = Number.isFinite(numeric) ? numeric.toFixed(2) : String(value);
+                              return [`${valueLabel} • Scouter: ${scouter}`, tagLabel];
+                            }}
+                            labelFormatter={(label) => `Match ${label}`}
+                          />
+                          <Line
+                            type="linear"
+                            dataKey="value"
+                            connectNulls
+                            stroke="#60a5fa"
+                            strokeWidth={3}
+                            dot={{ r: 3, fill: "#93c5fd", stroke: "#60a5fa" }}
+                            activeDot={{ r: 5 }}
+                            isAnimationActive
+                            animationDuration={520}
+                            animationEasing="ease-out"
+                          />
+                          {compareTeam && compareTeam !== activeTeam ? (
+                            <Line
+                              type="linear"
+                              dataKey="compareValue"
+                              connectNulls
+                              stroke="#f59e0b"
+                              strokeWidth={3}
+                              dot={{ r: 3, fill: "#fbbf24", stroke: "#f59e0b" }}
+                              activeDot={{ r: 5 }}
+                              isAnimationActive
+                              animationDuration={520}
+                              animationEasing="ease-out"
+                            />
+                          ) : null}
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <div className={`${isTeamGraphFullscreen ? "h-[calc(100dvh-280px)] min-h-[260px]" : "h-[420px]"} flex items-center justify-center rounded-lg border border-white/10 bg-slate-950/50 text-sm text-white/60`}>
+                      Select a tag to view the graph.
+                    </div>
+                  )}
+                </div>
+              </div>
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+    );
+  }
+
+  if (route.kind === "project") {
+    return (
+      <div className="min-h-screen bg-slate-900 text-white">
+        <header className="flex items-center justify-between border-b border-white/10 bg-slate-900 px-6 py-4">
+          <div className="text-4xl font-black tracking-tight text-white">GoonHQ</div>
+          <div className="flex items-center gap-3">
+            <Button type="button" className="h-10 rounded-xl bg-blue-600 px-5 text-white hover:bg-blue-500" onClick={() => setIsCreateDialogOpen(true)}>
+              <Plus className="mr-2 h-4 w-4" />
+              New Project
+            </Button>
+            <Button type="button" variant="outline" className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800" onClick={() => void refreshWorkspace()}>
+              <Upload className="mr-2 h-4 w-4" />
+              Upload
+            </Button>
+          </div>
+        </header>
+
+        <main className="grid h-[calc(100vh-73px)] grid-cols-1 items-start gap-4 p-4 md:grid-cols-12">
+          <aside className="flex h-full flex-col rounded-2xl border border-white/10 bg-slate-950/60 p-4 backdrop-blur md:col-span-3 xl:col-span-2">
+            <button
+              type="button"
+              className={`flex items-center gap-2 rounded-xl px-3 py-2 text-left transition ${projectSection === "overview" ? "bg-blue-600/20 text-white" : "text-white/80 hover:bg-white/5"}`}
+              onClick={() => setProjectSection("overview")}
+            >
+              <Home className="h-4 w-4" />
+              Overview
+            </button>
+            <button
+              type="button"
+              className={`mt-1 flex items-center gap-2 rounded-xl px-3 py-2 text-left transition ${projectSection === "config" ? "bg-blue-600/20 text-white" : "text-white/80 hover:bg-white/5"}`}
+              onClick={() => setProjectSection("config")}
+            >
+              <Settings className="h-4 w-4" />
+              Config
+            </button>
+            <button
+              type="button"
+              className={`mt-1 flex items-center gap-2 rounded-xl px-3 py-2 text-left transition ${projectSection === "compare" ? "bg-blue-600/20 text-white" : "text-white/80 hover:bg-white/5"}`}
+              onClick={() => setProjectSection("compare")}
+            >
+              <BarChart3 className="h-4 w-4" />
+              Compare
+            </button>
+            <button
+              type="button"
+              className={`mt-1 flex items-center gap-2 rounded-xl px-3 py-2 text-left transition ${projectSection === "picklist" ? "bg-blue-600/20 text-white" : "text-white/80 hover:bg-white/5"}`}
+              onClick={() => setProjectSection("picklist")}
+            >
+              <FileJson className="h-4 w-4" />
+              Picklist
+            </button>
+            <button
+              type="button"
+              className={`mt-1 flex items-center gap-2 rounded-xl px-3 py-2 text-left transition ${projectSection === "scouts" ? "bg-blue-600/20 text-white" : "text-white/80 hover:bg-white/5"}`}
+              onClick={() => setProjectSection("scouts")}
+            >
+              <Folder className="h-4 w-4" />
+              Scouts
+            </button>
+            <button
+              type="button"
+              className={`mt-1 flex items-center gap-2 rounded-xl px-3 py-2 text-left transition ${projectSection === "teams" ? "bg-blue-600/20 text-white" : "text-white/80 hover:bg-white/5"}`}
+              onClick={() => setProjectSection("teams")}
+            >
+              <Upload className="h-4 w-4" />
+              Teams
+            </button>
+            <button
+              type="button"
+              className={`mt-1 flex items-center gap-2 rounded-xl px-3 py-2 text-left transition ${projectSection === "data" ? "bg-blue-600/20 text-white" : "text-white/80 hover:bg-white/5"}`}
+              onClick={() => setProjectSection("data")}
+            >
+              <BarChart3 className="h-4 w-4" />
+              Data
+            </button>
+          </aside>
+
+          <section
+            className={`h-full rounded-2xl border border-white/10 bg-slate-950/60 p-4 ${
+              projectSection === "data" && isDataGraphFullscreen ? "" : "backdrop-blur"
+            } md:col-span-9 xl:col-span-10 ${
+              projectSection === "data" && isDataGraphFullscreen ? "overflow-hidden" : "overflow-auto"
+            }`}
+          >
+            {!selectedProject ? (
+              <div className="rounded-xl border border-white/10 bg-slate-900/40 px-4 py-8 text-sm text-white/70">
+                Project not found.
+              </div>
+            ) : projectSection === "overview" ? (
+              <div className="space-y-4">
+                <h1 className="text-4xl font-semibold tracking-tight">{selectedProject.name}</h1>
+                <p className="text-white/70">{fromUnixSecondsToUpdatedLabel(selectedProject.updated_at)}</p>
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                  <p className="text-sm text-white/80">Folder: {selectedProject.folder_path}</p>
+                  <p className="mt-2 text-sm text-white/80">Scanner JSON: {selectedProject.json_file_path ?? "No JSON file yet"}</p>
+                </div>
+                <JsonViewerPage initialPath={selectedProject.json_file_path ?? ""} projectId={selectedProject.id} embedded />
+              </div>
+            ) : projectSection === "config" ? (
+              <div className="space-y-4">
+                <h1 className="text-3xl font-semibold tracking-tight">Config</h1>
+                <p className="text-white/70">Project configuration tools will live here.</p>
+              </div>
+            ) : projectSection === "compare" ? (
+              <div className="space-y-4">
+                <h1 className="text-3xl font-semibold tracking-tight">Compare</h1>
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                  <div className="rounded-xl border border-white/10 bg-slate-900/60 p-4 text-sm text-white/80">Compare module: Coming soon</div>
+                  <div className="rounded-xl border border-white/10 bg-slate-900/60 p-4 text-sm text-white/80">Project-to-project diff: Coming soon</div>
+                  <div className="rounded-xl border border-white/10 bg-slate-900/60 p-4 text-sm text-white/80">Metrics sync: Coming soon</div>
+                </div>
+              </div>
+            ) : projectSection === "picklist" ? (
+              <div className="space-y-4">
+                <h1 className="text-3xl font-semibold tracking-tight">Picklist</h1>
+                <p className="text-white/70">Picklist tools and exports will live here.</p>
+              </div>
+            ) : projectSection === "scouts" ? (
+              <div className="space-y-4">
+                <h1 className="text-3xl font-semibold tracking-tight">Scouts</h1>
+                <p className="text-white/70">Filter by `scouter` and select a scout.</p>
+
+                <div className="relative max-w-xs">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
+                  <Input
+                    value={scoutSearch}
+                    onChange={(event) => setScoutSearch(event.currentTarget.value)}
+                    placeholder="Search scouts..."
+                    className="h-10 border-white/10 bg-slate-900/80 pl-9 text-white placeholder:text-white/35"
+                  />
+                </div>
+
+                {indexError ? <p className="text-sm text-red-300">{indexError}</p> : null}
+
+                {isLoadingIndex ? (
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">Loading scouts...</div>
+                ) : filteredScoutNames.length === 0 ? (
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">No scouts found from the `scouter` field in this JSON.</div>
+                ) : (
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                    {filteredScoutNames.map((scout) => {
+                      const selected = selectedScout === scout;
+                      return (
+                        <button
+                          key={scout}
+                          type="button"
+                          onClick={() => setSelectedScout(scout)}
+                          className={`rounded-lg border px-3 py-2 text-left text-sm font-medium transition ${
+                            selected
+                              ? "border-blue-400/70 bg-blue-600/20 text-white"
+                              : "border-white/15 bg-slate-900/70 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
+                          }`}
+                        >
+                          {scout}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ) : projectSection === "data" ? (
+              <div className="space-y-4">
+                <h1 className="text-3xl font-semibold tracking-tight">Data</h1>
+                <p className="text-white/70">Click X or Y axis, then click a tag to populate the graph using all teams and all matches.</p>
+
+                {indexError ? <p className="text-sm text-red-300">{indexError}</p> : null}
+
+                {isLoadingIndex ? (
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">Loading data...</div>
+                ) : allNumericTags.length === 0 ? (
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">No numeric tags available from this JSON.</div>
+                ) : (
+                  <div className={isDataGraphFullscreen ? "fixed inset-0 z-[200] overflow-y-auto bg-slate-950 p-4 md:p-6" : ""}>
+                    <div className="mb-3 flex items-center justify-end">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800"
+                        onClick={() => setIsDataGraphFullscreen((current) => !current)}
+                      >
+                        {isDataGraphFullscreen ? "Exit Full Screen" : "Full Screen"}
+                      </Button>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+                      <aside className="rounded-xl border border-white/10 bg-slate-900/50 p-3 xl:col-span-3">
+                        <p className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-white/55">Data Tags</p>
+                        <p className="mb-3 text-xs text-white/50">
+                          {dataGraphType === "bar"
+                            ? "Bar mode: select Y then optional Y2. Y2 must be matching auto/teleop pair."
+                            : "Select axis (X/Y), then click a tag."}
+                        </p>
+
+                        <div className="space-y-2">
+                          {allNumericTags.map((tag) => {
+                            const isX = dataGraphType === "scatter" && selectedDataXTag === tag;
+                            const isY = selectedDataYTag === tag;
+                            const isY2 = dataGraphType === "bar" && selectedDataYTagSecondary === tag;
+                            return (
+                              <button
+                                key={tag}
+                                type="button"
+                                onClick={() => {
+                                  const axis = dataGraphType === "bar" ? (activeDataAxis === "y2" ? "y2" : "y") : (activeDataAxis ?? "x");
+                                  if (axis === "x") {
+                                    setSelectedDataXTag(tag);
+                                    setDataTagSelectionError("");
+                                  } else if (axis === "y") {
+                                    setSelectedDataYTag(tag);
+                                    if (selectedDataYTagSecondary && !isAutoTeleopPair(tag, selectedDataYTagSecondary)) {
+                                      setSelectedDataYTagSecondary("");
+                                    }
+                                    setDataTagSelectionError("");
+                                  } else {
+                                    if (!selectedDataYTag) {
+                                      setDataTagSelectionError("Select Y axis tag first before Y2.");
+                                      return;
+                                    }
+                                    if (isAutoTeleopPair(selectedDataYTag, tag)) {
+                                      setSelectedDataYTagSecondary(tag);
+                                      setDataTagSelectionError("");
+                                    } else {
+                                      setDataTagSelectionError("Y2 must be the same metric with opposite auto/teleop prefix.");
+                                    }
+                                  }
+                                }}
+                                className={`w-full rounded-lg border px-3 py-2 text-left text-sm font-medium transition ${
+                                  isX && isY
+                                    ? "border-violet-400/70 bg-violet-600/20 text-white"
+                                    : isX
+                                      ? "border-blue-400/70 bg-blue-600/20 text-white"
+                                      : isY2
+                                        ? "border-emerald-400/70 bg-emerald-600/20 text-white"
+                                      : isY
+                                        ? "border-amber-400/70 bg-amber-600/20 text-white"
+                                        : "border-white/15 bg-slate-900/70 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
+                                }`}
+                              >
+                                {tag}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </aside>
+
+                      <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4 xl:col-span-9">
+                        <div className={`mb-3 grid grid-cols-1 gap-3 ${dataGraphType === "bar" ? "md:grid-cols-3" : "md:grid-cols-3"}`}>
+                          {dataGraphType === "scatter" ? (
+                            <button
+                              type="button"
+                              onClick={() => setActiveDataAxis("x")}
+                              className={`rounded-lg border px-3 py-2 text-left ${
+                                activeDataAxis === "x"
+                                  ? "border-blue-400/70 bg-blue-600/20"
+                                  : "border-dashed border-white/25 bg-slate-950/60"
+                              }`}
+                            >
+                              <p className="text-xs text-white/55">X Axis</p>
+                              <p className="mt-1 text-sm font-semibold text-white">{selectedDataXTag || "Click then select tag"}</p>
+                            </button>
+                          ) : null}
+
+                          <button
+                            type="button"
+                            onClick={() => setActiveDataAxis("y")}
+                            className={`rounded-lg border px-3 py-2 text-left ${
+                              activeDataAxis === "y"
+                                ? "border-amber-400/70 bg-amber-600/20"
+                                : "border-dashed border-white/25 bg-slate-950/60"
+                            }`}
+                          >
+                            <p className="text-xs text-white/55">Y Axis</p>
+                            <p className="mt-1 text-sm font-semibold text-white">{selectedDataYTag || "Click then select tag"}</p>
+                          </button>
+
+                          {dataGraphType === "bar" ? (
+                            <button
+                              type="button"
+                              onClick={() => setActiveDataAxis("y2")}
+                              className={`rounded-lg border px-3 py-2 text-left ${
+                                activeDataAxis === "y2"
+                                  ? "border-emerald-400/70 bg-emerald-600/20"
+                                  : "border-dashed border-white/25 bg-slate-950/60"
+                              }`}
+                            >
+                              <p className="text-xs text-white/55">Y2 Axis (optional)</p>
+                              <p className="mt-1 text-sm font-semibold text-white">{selectedDataYTagSecondary || "Click then select auto/teleop pair"}</p>
+                            </button>
+                          ) : null}
+
+                          <div className="flex items-end gap-2">
+                            <Button
+                              type="button"
+                              variant={dataGraphType === "scatter" ? "default" : "outline"}
+                              className={dataGraphType === "scatter" ? "bg-blue-600 text-white hover:bg-blue-500" : "border-white/20 bg-slate-900/60 text-white hover:bg-slate-800"}
+                              onClick={() => setDataGraphType("scatter")}
+                            >
+                              Scatter
+                            </Button>
+                            <Button
+                              type="button"
+                              variant={dataGraphType === "bar" ? "default" : "outline"}
+                              className={dataGraphType === "bar" ? "bg-blue-600 text-white hover:bg-blue-500" : "border-white/20 bg-slate-900/60 text-white hover:bg-slate-800"}
+                              onClick={() => {
+                                setDataGraphType("bar");
+                                setDataTagSelectionError("");
+                              }}
+                            >
+                              Bar
+                            </Button>
+                          </div>
+                        </div>
+
+                        {dataTagSelectionError ? <p className="mb-2 text-xs text-amber-300">{dataTagSelectionError}</p> : null}
+
+                        <div className="mb-3 flex items-center gap-2">
+                          <Search className="h-4 w-4 text-white/55" />
+                          <Input
+                            value={dataTeamSearch}
+                            onChange={(event) => setDataTeamSearch(event.currentTarget.value)}
+                            placeholder="Search team to highlight..."
+                            className="h-9 max-w-xs border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                          />
+                        </div>
+
+                        {normalizedDataTeamSearch ? (
+                          <p className="mb-2 text-xs text-white/70">
+                            {dataGraphType === "scatter"
+                              ? foundScatterTeam
+                                ? `Highlighted Team ${foundScatterTeam.team} at X ${foundScatterTeam.x.toFixed(2)}, Y ${foundScatterTeam.y.toFixed(2)}.`
+                                : "No matching team found in scatter data."
+                              : foundBarTeamIndex >= 0
+                                ? `Highlighted Team ${dataBarRows[foundBarTeamIndex].team} at rank ${foundBarTeamIndex + 1}.`
+                                : "No matching team found in bar data."}
+                          </p>
+                        ) : null}
+
+                        <p className="mb-3 text-xs text-white/55">
+                          {dataGraphType === "scatter"
+                            ? "Scatter plot is sorted by Y value (best to worst) across all teams and matches."
+                            : "Bar graph ranks teams from best to worst by total score (Y + Y2 when selected)."}
+                        </p>
+
+                        <div className={isDataGraphFullscreen ? "h-[calc(100dvh-280px)] min-h-[280px] w-full" : "h-[460px] w-full"}>
+                          <ResponsiveContainer width="100%" height="100%">
+                            {dataGraphType === "scatter" ? (
+                              <ScatterChart margin={{ top: 12, right: 20, left: 10, bottom: 14 }}>
+                                <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
+                                <XAxis
+                                  type="number"
+                                  dataKey="x"
+                                  name={selectedDataXTag || "x"}
+                                  domain={["auto", "auto"]}
+                                  tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
+                                />
+                                <YAxis
+                                  type="number"
+                                  dataKey="y"
+                                  name={selectedDataYTag || "y"}
+                                  domain={["auto", "auto"]}
+                                  tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
+                                  width={70}
+                                />
+                                <Tooltip
+                                  contentStyle={{
+                                    backgroundColor: "rgba(2,6,23,0.95)",
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    borderRadius: "0.75rem",
+                                    color: "white",
+                                  }}
+                                  formatter={(value, name, item) => {
+                                    const row = item.payload as { team: string; matches: number };
+                                    const numeric = typeof value === "number" ? value : Number(value);
+                                    const axisKey = String(item.dataKey ?? name);
+                                    const label = axisKey === "x" ? selectedDataXTag : selectedDataYTag;
+                                    return [
+                                      `${Number.isFinite(numeric) ? numeric.toFixed(2) : String(value)} • Team ${row.team} • Matches ${row.matches}`,
+                                      label || String(name),
+                                    ];
+                                  }}
+                                />
+                                <Scatter data={regularScatterRows} fill="#60a5fa">
+                                  <LabelList dataKey="team" position="bottom" fill="rgba(255,255,255,0.72)" fontSize={11} />
+                                </Scatter>
+                                {highlightedScatterRows.length > 0 ? (
+                                  <Scatter data={highlightedScatterRows} fill="#f59e0b">
+                                    <LabelList dataKey="team" position="bottom" fill="rgba(251,191,36,0.95)" fontSize={12} fontWeight={700} />
+                                  </Scatter>
+                                ) : null}
+                              </ScatterChart>
+                            ) : (
+                              <BarChart data={dataBarRows} margin={{ top: 12, right: 20, left: 10, bottom: 70 }}>
+                                <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
+                                <XAxis
+                                  dataKey="team"
+                                  interval={0}
+                                  angle={-35}
+                                  textAnchor="end"
+                                  height={70}
+                                  tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 11 }}
+                                />
+                                <YAxis
+                                  domain={["auto", "auto"]}
+                                  tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
+                                  width={70}
+                                />
+                                <Tooltip
+                                  contentStyle={{
+                                    backgroundColor: "rgba(2,6,23,0.95)",
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    borderRadius: "0.75rem",
+                                    color: "white",
+                                  }}
+                                  formatter={(value, name, item) => {
+                                    const numeric = typeof value === "number" ? value : Number(value);
+                                    const labelName = name === "secondaryValue" ? (selectedDataYTagSecondary || "Y2") : selectedDataYTag;
+                                    const row = item.payload as { totalValue: number };
+                                    return [
+                                      `${Number.isFinite(numeric) ? numeric.toFixed(2) : String(value)} • Total ${row.totalValue.toFixed(2)}`,
+                                      `${labelName} (avg)`,
+                                    ];
+                                  }}
+                                  labelFormatter={(label) => `Team ${label}`}
+                                />
+                                <Bar dataKey="primaryValue" stackId="score" radius={[0, 0, 0, 0]} name={selectedDataYTag || "Y"}>
+                                  {dataBarRows.map((row) => (
+                                    <Cell key={`primary-${row.team}`} fill={highlightedBarTeams.has(row.team) ? "#93c5fd" : "#60a5fa"} />
+                                  ))}
+                                </Bar>
+                                {selectedDataYTagSecondary ? (
+                                  <Bar dataKey="secondaryValue" stackId="score" radius={[6, 6, 0, 0]} name={selectedDataYTagSecondary}>
+                                    {dataBarRows.map((row) => (
+                                      <Cell key={`secondary-${row.team}`} fill={highlightedBarTeams.has(row.team) ? "#facc15" : "#f59e0b"} />
+                                    ))}
+                                  </Bar>
+                                ) : null}
+                              </BarChart>
+                            )}
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <h1 className="text-3xl font-semibold tracking-tight">Teams</h1>
+                <p className="text-white/70">Filter by the `team` tag and select a team number.</p>
+
+                <div className="relative max-w-xs">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
+                  <Input
+                    value={teamSearch}
+                    onChange={(event) => setTeamSearch(event.currentTarget.value)}
+                    placeholder="Search teams..."
+                    className="h-10 border-white/10 bg-slate-900/80 pl-9 text-white placeholder:text-white/35"
+                  />
+                </div>
+
+                {indexError ? <p className="text-sm text-red-300">{indexError}</p> : null}
+
+                {isLoadingIndex ? (
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">Loading teams...</div>
+                ) : filteredTeamNumbers.length === 0 ? (
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">No teams found from the `team` field in this JSON.</div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6">
+                    {filteredTeamNumbers.map((team) => {
+                      const selected = selectedTeam === team;
+                      return (
+                        <button
+                          key={team}
+                          type="button"
+                          onClick={() => setSelectedTeam(team)}
+                          onDoubleClick={() => navigateTeam(selectedProject.id, team)}
+                          className={`rounded-lg border px-3 py-2 text-center text-sm font-medium transition ${
+                            selected
+                              ? "border-blue-400/70 bg-blue-600/20 text-white"
+                              : "border-white/15 bg-slate-900/70 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
+                          }`}
+                        >
+                          {team}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {selectedTeam ? (
+                  <div className="space-y-3 rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                    <p className="text-sm text-white/75">
+                      Team <span className="font-semibold text-white">{selectedTeam}</span> • Matches: {selectedTeamMatchCount}
+                    </p>
+
+                    {teamAverages.length === 0 ? (
+                      <p className="text-sm text-white/60">No numeric tags available for averages.</p>
+                    ) : (
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                        {teamAverages.map((item) => (
+                          <div key={item.tag} className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                            <p className="text-xs uppercase tracking-wide text-white/55">{item.tag}</p>
+                            <p className="mt-2 text-2xl font-semibold text-white">{item.average.toFixed(2)}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </section>
+        </main>
+
+        <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
+          <DialogContent className="border-white/10 bg-slate-950 text-white sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Create Project</DialogTitle>
+              <DialogDescription className="text-white/65">This creates a new folder under GoonHQMain/projects.</DialogDescription>
+            </DialogHeader>
+            <Input value={createProjectName} onChange={(event) => setCreateProjectName(event.target.value)} className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+            <DialogFooter>
+              <Button type="button" variant="outline" className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800" onClick={() => setIsCreateDialogOpen(false)} disabled={isCreatingProject}>
+                Cancel
+              </Button>
+              <Button type="button" className="bg-blue-600 text-white hover:bg-blue-500" onClick={() => void handleCreateProject()} disabled={isCreatingProject}>
+                {isCreatingProject ? "Creating..." : "Create"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-white">
+      <header className="flex items-center justify-between border-b border-white/10 bg-slate-900 px-6 py-4">
+        <div className="text-4xl font-black tracking-tight text-white">GoonHQ</div>
+        <div className="flex items-center gap-3">
+          <Button type="button" className="h-10 rounded-xl bg-blue-600 px-5 text-white hover:bg-blue-500" onClick={() => setIsCreateDialogOpen(true)}>
+            <Plus className="mr-2 h-4 w-4" />
+            New Project
+          </Button>
+          <Button type="button" variant="outline" className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800" onClick={() => void refreshWorkspace()}>
+            <Upload className="mr-2 h-4 w-4" />
+            Upload
+          </Button>
+        </div>
+      </header>
+
+      <main className="grid h-[calc(100vh-73px)] grid-cols-1 items-start gap-4 p-4 md:grid-cols-12">
+        <aside className="flex h-full flex-col rounded-2xl border border-white/10 bg-slate-950/60 p-4 backdrop-blur md:col-span-3 xl:col-span-2">
+          <div className="relative mb-5">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
+            <Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search projects..." className="h-10 border-white/10 bg-slate-900/80 pl-9 text-white placeholder:text-white/35" />
+          </div>
+
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-white/55">Projects</p>
+          <div className="rounded-xl border border-white/10 bg-slate-900/40 px-3 py-2 text-sm text-white/70">Total Projects: {workspace?.projects.length ?? 0}</div>
+
+          <div className="mt-auto pt-6">
+            <Button type="button" variant="outline" className="w-full justify-start border-white/20 bg-slate-900/60 text-white hover:bg-slate-800" onClick={() => navigateViewer()}>
+              <FileJson className="mr-2 h-4 w-4" />
+              Open JSON Viewer
+            </Button>
+          </div>
+        </aside>
+
+        <section className="h-full overflow-auto rounded-2xl border border-white/10 bg-slate-950/60 p-4 backdrop-blur md:col-span-9 xl:col-span-10">
+          <div className="mb-4 flex items-center justify-between gap-4">
+            <h1 className="text-4xl font-semibold tracking-tight">My Projects</h1>
+            <div className="relative w-full max-w-xs">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
+              <Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search..." className="h-10 border-white/10 bg-slate-900/80 pl-9 text-white placeholder:text-white/35" />
+            </div>
+          </div>
+
+          {workspace?.root_path ? <p className="mb-2 text-xs text-white/45">Workspace root: {workspace.root_path}</p> : null}
+          {workspaceError ? <p className="mb-2 text-sm text-red-300">{workspaceError}</p> : null}
+
+          {isLoadingWorkspace ? (
+            <div className="rounded-xl border border-white/10 bg-slate-900/40 px-4 py-8 text-sm text-white/70">Loading projects...</div>
+          ) : displayedProjects.length === 0 ? (
+            <div className="rounded-xl border border-white/10 bg-slate-900/40 px-4 py-8 text-sm text-white/70">No projects found in GoonHQMain/projects.</div>
+          ) : (
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+              {displayedProjects.map((project) => (
+                <article key={project.id} className="overflow-hidden rounded-2xl border border-white/10 bg-slate-950/70 transition hover:border-blue-400/45">
+                  <div className="h-40 w-full border-b border-white/10" style={{ background: cardGradient }} />
+                  <button type="button" className="w-full p-4 text-left" onClick={() => navigateProject(project.id)}>
+                    <h2 className="text-3xl font-semibold leading-tight">{project.name}</h2>
+                    <p className="mt-2 text-base text-white/65">{fromUnixSecondsToUpdatedLabel(project.updated_at)}</p>
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      </main>
+
+      <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
+        <DialogContent className="border-white/10 bg-slate-950 text-white sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Create Project</DialogTitle>
+            <DialogDescription className="text-white/65">This creates a new folder under GoonHQMain/projects.</DialogDescription>
+          </DialogHeader>
+          <Input value={createProjectName} onChange={(event) => setCreateProjectName(event.target.value)} className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+          <DialogFooter>
+            <Button type="button" variant="outline" className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800" onClick={() => setIsCreateDialogOpen(false)} disabled={isCreatingProject}>
+              Cancel
+            </Button>
+            <Button type="button" className="bg-blue-600 text-white hover:bg-blue-500" onClick={() => void handleCreateProject()} disabled={isCreatingProject}>
+              {isCreatingProject ? "Creating..." : "Create"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }
 
