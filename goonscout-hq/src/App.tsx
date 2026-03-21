@@ -25,6 +25,8 @@ type EditingState =
       draft: string;
     };
 
+//test
+
 function pathEquals(left: JsonPath, right: JsonPath): boolean {
   if (left.length !== right.length) {
     return false;
