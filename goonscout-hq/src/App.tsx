@@ -1,11 +1,14 @@
 import * as React from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { BarChart3, FileJson, Folder, Home, Plus, Search, Settings, Upload } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Cell, LabelList, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { Button } from "@/components/ui/button";
+import MiniScoutField from "@/components/MiniScoutField";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { extractEntryNumericMetrics, normalizeScoutingDataset, type ScoutingFieldMapping } from "./lib/scoutingPayload";
 import JsonViewerPage from "@/pages/JsonViewerPage";
 
 type WorkspaceProject = {
@@ -22,24 +25,87 @@ type WorkspaceOverview = {
   projects: WorkspaceProject[];
 };
 
+type ContentHashValidationResult = {
+  valid: boolean;
+  content_hash: string;
+  scout_type?: string | null;
+  message: string;
+  field_mapping?: unknown;
+  payload?: unknown;
+  background_image?: string | null;
+  background_location?: string | null;
+};
+
+type ProjectConfig = {
+  matchContentHash: string;
+  qualitativeContentHash: string;
+  pitContentHash: string;
+  backgroundImage?: string | null;
+  backgroundLocation?: string | null;
+  fieldMapping?: unknown;
+  layoutPayload?: unknown;
+  updatedAt?: number;
+};
+
 type ParsedRoute =
   | { kind: "home" }
   | { kind: "project"; projectId: string }
   | { kind: "team"; projectId: string; team: string }
+  | { kind: "match"; projectId: string; team: string; match: number }
   | { kind: "viewer"; projectId?: string };
 
 type ProjectSection = "overview" | "config" | "compare" | "picklist" | "scouts" | "teams" | "data";
 type JsonEntry = Record<string, unknown>;
 type TeamSeriesPoint = { match: number; value: number; scouter: string };
 type TeamChartPoint = { match: number; value: number | null; compareValue: number | null; scouter: string; compareScouter: string };
-type DataGraphType = "scatter" | "bar";
+type DataGraphType = "scatter" | "bar" | "weighted";
+
+type WeightedMetricSelection = {
+  id: string;
+  baseMetric: string;
+  phase: "auto" | "teleop";
+  weight: number;
+};
+
+type SavedCycleMetric = {
+  id: string;
+  name: string;
+  startTag: string;
+  endTag: string;
+};
+
+type SavedPicklist = {
+  id: string;
+  name: string;
+  metricWeights: Record<string, number>;
+  order: string[];
+  struckTeams: string[];
+};
+
+type DataMetricVariant = "value" | "accuracy" | "attempts";
+
+type DataTagVariantGroup = {
+  key: DataMetricVariant;
+  label: string;
+  tagsByPhase: Partial<Record<"auto" | "teleop", string>>;
+};
 
 function parseHashRoute(hashValue: string): ParsedRoute {
   const hash = hashValue || "#/";
 
   const pathOnly = hash.split("?")[0] ?? "#/";
   const decodedPath = decodeURIComponent(pathOnly);
+  const matchRoute = decodedPath.match(/^#\/project\/([^/]+)\/match\/([^/]+)\/(\d+)$/);
   const teamMatch = decodedPath.match(/^#\/project\/([^/]+)\/team\/(.+)$/);
+
+  if (matchRoute) {
+    return {
+      kind: "match",
+      projectId: matchRoute[1],
+      team: matchRoute[2],
+      match: Number(matchRoute[3]),
+    };
+  }
 
   if (teamMatch) {
     return {
@@ -80,6 +146,10 @@ function buildTeamHash(projectId: string, team: string): string {
   return `#/project/${encodeURIComponent(projectId)}/team/${encodeURIComponent(team)}`;
 }
 
+function buildMatchHash(projectId: string, team: string, match: number): string {
+  return `#/project/${encodeURIComponent(projectId)}/match/${encodeURIComponent(team)}/${encodeURIComponent(String(match))}`;
+}
+
 function buildViewerHash(project?: WorkspaceProject): string {
   const params = new URLSearchParams();
 
@@ -117,6 +187,122 @@ function fromUnixSecondsToUpdatedLabel(timestamp: number): string {
   return `Last edited: ${then.toLocaleString("en-US", { month: "short" })} ${then.getDate()}`;
 }
 
+function isScoutingFieldMapping(value: unknown): value is ScoutingFieldMapping {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const mappingValue = (value as { mapping?: unknown }).mapping;
+  return Boolean(mappingValue && typeof mappingValue === "object" && !Array.isArray(mappingValue));
+}
+
+function splitMetricTag(tag: string): { phase: "auto" | "teleop"; metric: string } | null {
+  if (tag.startsWith("auto.")) {
+    return { phase: "auto", metric: tag.slice("auto.".length) };
+  }
+  if (tag.startsWith("teleop.")) {
+    return { phase: "teleop", metric: tag.slice("teleop.".length) };
+  }
+  return null;
+}
+
+function formatMetricTagLabel(tag: string): string {
+  const parsed = splitMetricTag(tag);
+  if (!parsed) {
+    return tag;
+  }
+  return `${parsed.metric} • ${parsed.phase}`;
+}
+
+function compareMetricTags(leftTag: string, rightTag: string): number {
+  const left = splitMetricTag(leftTag);
+  const right = splitMetricTag(rightTag);
+
+  if (left && right) {
+    const baseCompare = left.metric.localeCompare(right.metric);
+    if (baseCompare !== 0) {
+      return baseCompare;
+    }
+
+    const phaseOrder = left.phase === right.phase ? 0 : left.phase === "auto" ? -1 : 1;
+    if (phaseOrder !== 0) {
+      return phaseOrder;
+    }
+
+    return leftTag.localeCompare(rightTag);
+  }
+
+  if (left && !right) {
+    return -1;
+  }
+
+  if (!left && right) {
+    return 1;
+  }
+
+  return leftTag.localeCompare(rightTag);
+}
+
+function parseMetricVariant(metric: string): { base: string; variant: DataMetricVariant | null } {
+  if (metric.endsWith(".successes") || metric.endsWith(".fails")) {
+    return { base: metric.replace(/\.(successes|fails)$/i, ""), variant: null };
+  }
+
+  if (metric.endsWith(".accuracy")) {
+    return { base: metric.slice(0, -".accuracy".length), variant: "accuracy" };
+  }
+
+  if (metric.endsWith(".attempts")) {
+    return { base: metric.slice(0, -".attempts".length), variant: "attempts" };
+  }
+
+  return { base: metric, variant: "value" };
+}
+
+function buildTagFromSelection(phase: "auto" | "teleop", base: string, variant: DataMetricVariant): string {
+  if (variant === "value") {
+    return `${phase}.${base}`;
+  }
+
+  return `${phase}.${base}.${variant}`;
+}
+
+function highlightSearchTerm(text: string, term: string): React.ReactNode {
+  if (!term.trim()) {
+    return text;
+  }
+
+  const normalizedTerm = term.trim();
+  const matcher = new RegExp(`(${normalizedTerm.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")})`, "ig");
+  const parts = text.split(matcher);
+
+  return parts.map((part, index) =>
+    part.toLowerCase() === normalizedTerm.toLowerCase() ? (
+      <mark key={`highlight-${index}`} className="rounded bg-yellow-300/35 px-0.5 text-white">
+        {part}
+      </mark>
+    ) : (
+      <React.Fragment key={`highlight-${index}`}>{part}</React.Fragment>
+    ),
+  );
+}
+
+function parseLayoutPayload(value: unknown): unknown {
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  if (value && typeof value === "object") {
+    return value;
+  }
+
+  return null;
+}
+
 const cardGradient =
   "radial-gradient(circle at 20% 20%, rgba(59,130,246,0.16), transparent 42%), radial-gradient(circle at 80% 35%, rgba(30,64,175,0.25), transparent 45%), linear-gradient(180deg, rgba(15,23,42,0.9), rgba(10,15,32,0.95))";
 
@@ -128,11 +314,32 @@ function App() {
   const [search, setSearch] = React.useState("");
 
   const [isCreateDialogOpen, setIsCreateDialogOpen] = React.useState(false);
+  const [isDebugDialogOpen, setIsDebugDialogOpen] = React.useState(false);
   const [isCreatingProject, setIsCreatingProject] = React.useState(false);
+  const [isRunningDebugValidation, setIsRunningDebugValidation] = React.useState(false);
+  const [isSettingRootFolder, setIsSettingRootFolder] = React.useState(false);
   const [createProjectName, setCreateProjectName] = React.useState("Untitled Project");
+  const [createProjectContentHash, setCreateProjectContentHash] = React.useState("");
+  const [debugContentHash, setDebugContentHash] = React.useState("");
+  const [debugScoutType, setDebugScoutType] = React.useState<"match" | "qualitative" | "pit">("match");
+  const [debugResult, setDebugResult] = React.useState<ContentHashValidationResult | null>(null);
+  const [debugMessage, setDebugMessage] = React.useState("");
+
+  const [projectConfig, setProjectConfig] = React.useState<ProjectConfig>({
+    matchContentHash: "",
+    qualitativeContentHash: "",
+    pitContentHash: "",
+    backgroundImage: null,
+    backgroundLocation: null,
+    fieldMapping: null,
+  });
+  const [configStatus, setConfigStatus] = React.useState("");
+  const [isSavingConfig, setIsSavingConfig] = React.useState(false);
+  const [decodeFieldMapping, setDecodeFieldMapping] = React.useState<ScoutingFieldMapping | null>(null);
 
   const [projectSection, setProjectSection] = React.useState<ProjectSection>("overview");
   const [teamSearch, setTeamSearch] = React.useState("");
+  const [teamNoteSearch, setTeamNoteSearch] = React.useState("");
   const [teamNumbers, setTeamNumbers] = React.useState<string[]>([]);
   const [selectedTeam, setSelectedTeam] = React.useState("");
   const [scoutSearch, setScoutSearch] = React.useState("");
@@ -144,17 +351,37 @@ function App() {
   const [selectedDataYTagSecondary, setSelectedDataYTagSecondary] = React.useState("");
   const [activeDataAxis, setActiveDataAxis] = React.useState<"x" | "y" | "y2" | null>("x");
   const [dataGraphType, setDataGraphType] = React.useState<DataGraphType>("scatter");
+  const [selectedDataXBaseMetric, setSelectedDataXBaseMetric] = React.useState("");
+  const [selectedDataYBaseMetric, setSelectedDataYBaseMetric] = React.useState("");
+  const [selectedDataY2BaseMetric, setSelectedDataY2BaseMetric] = React.useState("");
+  const [selectedDataXVariant, setSelectedDataXVariant] = React.useState<DataMetricVariant>("value");
+  const [selectedDataYVariant, setSelectedDataYVariant] = React.useState<DataMetricVariant>("value");
+  const [selectedDataY2Variant, setSelectedDataY2Variant] = React.useState<DataMetricVariant>("value");
+  const [expandedDataMetricBase, setExpandedDataMetricBase] = React.useState("");
+  const [expandedDataMetricVariant, setExpandedDataMetricVariant] = React.useState<DataMetricVariant | null>(null);
+  const [selectedDataXPhase, setSelectedDataXPhase] = React.useState<"auto" | "teleop">("auto");
+  const [selectedDataYPhase, setSelectedDataYPhase] = React.useState<"auto" | "teleop">("teleop");
+  const [selectedDataY2Phase, setSelectedDataY2Phase] = React.useState<"auto" | "teleop">("auto");
+  const [weightedMetricSelections, setWeightedMetricSelections] = React.useState<WeightedMetricSelection[]>([]);
   const [dataTeamSearch, setDataTeamSearch] = React.useState("");
+  const [picklistMetricSearch, setPicklistMetricSearch] = React.useState("");
   const [dataTagSelectionError, setDataTagSelectionError] = React.useState("");
   const [isDataGraphFullscreen, setIsDataGraphFullscreen] = React.useState(false);
-  const [teamTagOrder, setTeamTagOrder] = React.useState<string[]>([]);
   const [selectedTeamTag, setSelectedTeamTag] = React.useState("");
+  const [expandedTeamMetricBase, setExpandedTeamMetricBase] = React.useState("");
   const [compareTeamInput, setCompareTeamInput] = React.useState("");
   const [isTeamGraphFullscreen, setIsTeamGraphFullscreen] = React.useState(false);
-  const [draggingTeamTag, setDraggingTeamTag] = React.useState<string | null>(null);
   const [animatedChartData, setAnimatedChartData] = React.useState<TeamChartPoint[]>([]);
   const [isLoadingIndex, setIsLoadingIndex] = React.useState(false);
   const [indexError, setIndexError] = React.useState("");
+  const [savedCycleMetrics, setSavedCycleMetrics] = React.useState<SavedCycleMetric[]>([]);
+  const [cycleStartTag, setCycleStartTag] = React.useState("");
+  const [cycleEndTag, setCycleEndTag] = React.useState("");
+  const [cycleMetricName, setCycleMetricName] = React.useState("");
+  const [picklists, setPicklists] = React.useState<SavedPicklist[]>([]);
+  const [activePicklistId, setActivePicklistId] = React.useState<string>("default");
+  const [newPicklistName, setNewPicklistName] = React.useState("");
+  const [draggingPickTeam, setDraggingPickTeam] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     const onHashChange = () => {
@@ -200,6 +427,8 @@ function App() {
           ? route.projectId
           : route.kind === "team"
             ? route.projectId
+            : route.kind === "match"
+              ? route.projectId
             : undefined;
     if (!projectId) {
       return null;
@@ -217,8 +446,9 @@ function App() {
 
     const needsIndexForProjectTabs = route.kind === "project" && (projectSection === "teams" || projectSection === "scouts" || projectSection === "data");
     const needsIndexForTeamPage = route.kind === "team";
+    const needsIndexForMatchPage = route.kind === "match";
 
-    if (!needsIndexForProjectTabs && !needsIndexForTeamPage) {
+    if (!needsIndexForProjectTabs && !needsIndexForTeamPage && !needsIndexForMatchPage) {
       return;
     }
 
@@ -226,6 +456,14 @@ function App() {
       setJsonEntries([]);
       setTeamNumbers([]);
       setScoutNames([]);
+      return;
+    }
+
+    if (!decodeFieldMapping) {
+      setJsonEntries([]);
+      setTeamNumbers([]);
+      setScoutNames([]);
+      setIndexError("Missing field mapping. Validate the project match content hash in Config to decode compressed data.");
       return;
     }
 
@@ -240,14 +478,17 @@ function App() {
         });
 
         const parsed = JSON.parse(content) as unknown;
-        const rawEntries = Array.isArray(parsed)
-          ? parsed
-          : parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).data)
-            ? ((parsed as Record<string, unknown>).data as unknown[])
-            : [];
+        const sourceObject = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+        const rawEntries = Array.isArray(parsed) ? parsed : sourceObject && Array.isArray(sourceObject.data) ? sourceObject.data : sourceObject ? [sourceObject] : [];
+        const entries = normalizeScoutingDataset(parsed, {
+          fieldMapping: decodeFieldMapping,
+          compressedOnly: true,
+          requireFieldMapping: true,
+        });
 
-        const entries = rawEntries
-          .filter((entry): entry is JsonEntry => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry));
+        if (rawEntries.length > 0 && entries.length === 0) {
+          throw new Error("No entries decoded. File appears to be non-compressed/legacy format or has mismatched field mapping.");
+        }
 
         const uniqueTeams = new Set<string>();
         const uniqueScouts = new Set<string>();
@@ -291,7 +532,248 @@ function App() {
     return () => {
       isCancelled = true;
     };
-  }, [projectSection, route.kind, selectedProject?.json_file_path]);
+  }, [decodeFieldMapping, projectSection, route.kind, selectedProject?.json_file_path]);
+
+  React.useEffect(() => {
+    if ((route.kind !== "project" && route.kind !== "team" && route.kind !== "match") || !selectedProject) {
+      return;
+    }
+
+    let isCancelled = false;
+
+    const loadProjectConfig = async () => {
+      try {
+        const loaded = await invoke<ProjectConfig>("get_project_config", {
+          projectId: selectedProject.id,
+        });
+
+        if (!isCancelled) {
+          setProjectConfig({
+            matchContentHash: String(loaded.matchContentHash ?? ""),
+            qualitativeContentHash: String(loaded.qualitativeContentHash ?? ""),
+            pitContentHash: String(loaded.pitContentHash ?? ""),
+            backgroundImage: loaded.backgroundImage ?? null,
+            backgroundLocation: loaded.backgroundLocation ?? null,
+            fieldMapping: loaded.fieldMapping ?? null,
+            layoutPayload: loaded.layoutPayload ?? null,
+            updatedAt: loaded.updatedAt,
+          });
+        }
+      } catch {
+        if (!isCancelled) {
+          setProjectConfig({
+            matchContentHash: "",
+            qualitativeContentHash: "",
+            pitContentHash: "",
+            backgroundImage: null,
+            backgroundLocation: null,
+            fieldMapping: null,
+            layoutPayload: null,
+          });
+        }
+      }
+    };
+
+    void loadProjectConfig();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [route.kind, selectedProject]);
+
+  React.useEffect(() => {
+    if ((route.kind !== "project" && route.kind !== "team" && route.kind !== "match") || !selectedProject) {
+      setDecodeFieldMapping(null);
+      return;
+    }
+
+    let isCancelled = false;
+
+    const resolveMapping = async () => {
+      const storedMapping = isScoutingFieldMapping(projectConfig.fieldMapping) ? projectConfig.fieldMapping : null;
+      const hasStoredMapping = Boolean(storedMapping);
+      const hasStoredLayoutPayload = Boolean(parseLayoutPayload(projectConfig.layoutPayload));
+      const hasStoredBackgroundImage = Boolean(projectConfig.backgroundImage);
+
+      if (hasStoredMapping && !isCancelled) {
+        setDecodeFieldMapping(storedMapping);
+      }
+
+      if (hasStoredMapping && hasStoredLayoutPayload && hasStoredBackgroundImage) {
+        return;
+      }
+
+      const hash = projectConfig.matchContentHash?.trim();
+      if (!hash) {
+        if (!isCancelled) {
+            setDecodeFieldMapping(storedMapping);
+        }
+        return;
+      }
+
+      try {
+        const validation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+          contentHash: hash,
+          expectedScoutType: "match",
+        });
+
+        if (!validation.valid || !isScoutingFieldMapping(validation.field_mapping)) {
+          if (!isCancelled) {
+            if (hasStoredMapping) {
+              setDecodeFieldMapping(storedMapping);
+            } else {
+              setDecodeFieldMapping(null);
+              setIndexError(`Unable to resolve field mapping from Supabase for hash '${hash}'.`);
+            }
+          }
+          return;
+        }
+
+        if (isCancelled) {
+          return;
+        }
+
+        const nextConfig: ProjectConfig = {
+          ...projectConfig,
+          fieldMapping: validation.field_mapping,
+          layoutPayload: validation.payload ?? projectConfig.layoutPayload ?? null,
+          backgroundImage: validation.background_image ?? projectConfig.backgroundImage ?? null,
+          backgroundLocation: validation.background_location ?? projectConfig.backgroundLocation ?? null,
+        };
+
+        setDecodeFieldMapping(validation.field_mapping);
+
+        const configChanged =
+          JSON.stringify(nextConfig.fieldMapping) !== JSON.stringify(projectConfig.fieldMapping) ||
+          JSON.stringify(nextConfig.layoutPayload ?? null) !== JSON.stringify(projectConfig.layoutPayload ?? null) ||
+          nextConfig.backgroundImage !== projectConfig.backgroundImage ||
+          JSON.stringify(nextConfig.backgroundLocation ?? null) !== JSON.stringify(projectConfig.backgroundLocation ?? null);
+
+        if (configChanged) {
+          setProjectConfig(nextConfig);
+
+          await invoke("save_project_config", {
+            projectId: selectedProject.id,
+            config: nextConfig,
+          });
+        }
+      } catch {
+        if (!isCancelled) {
+          if (hasStoredMapping) {
+            setDecodeFieldMapping(storedMapping);
+          } else {
+            setDecodeFieldMapping(null);
+            setIndexError("Failed to fetch field mapping from Supabase.");
+          }
+        }
+      }
+    };
+
+    void resolveMapping();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [projectConfig, route.kind, selectedProject]);
+
+  React.useEffect(() => {
+    if (!selectedProject) {
+      return;
+    }
+
+    let isCancelled = false;
+
+    const loadProjectDataFiles = async () => {
+      try {
+        const loadedMetrics = await invoke<SavedCycleMetric[]>("read_or_init_project_data_file", {
+          projectId: selectedProject.id,
+          fileName: "metrics.json",
+          defaultContent: [],
+        });
+
+        if (!isCancelled) {
+          setSavedCycleMetrics(Array.isArray(loadedMetrics) ? loadedMetrics : []);
+        }
+      } catch {
+        if (!isCancelled) {
+          setSavedCycleMetrics([]);
+        }
+      }
+
+      try {
+        const loadedPicklists = await invoke<SavedPicklist[]>("read_or_init_project_data_file", {
+          projectId: selectedProject.id,
+          fileName: "picklists.json",
+          defaultContent: [
+            {
+              id: "default",
+              name: "Default Picklist",
+              metricWeights: {},
+              order: [],
+              struckTeams: [],
+            },
+          ],
+        });
+
+        if (!isCancelled) {
+          const validPicklists = Array.isArray(loadedPicklists) && loadedPicklists.length > 0 ? loadedPicklists : [
+            {
+              id: "default",
+              name: "Default Picklist",
+              metricWeights: {},
+              order: [],
+              struckTeams: [],
+            },
+          ];
+          setPicklists(validPicklists);
+          setActivePicklistId((previous) => (validPicklists.some((picklist) => picklist.id === previous) ? previous : validPicklists[0].id));
+        }
+      } catch {
+        if (!isCancelled) {
+          setPicklists([
+            {
+              id: "default",
+              name: "Default Picklist",
+              metricWeights: {},
+              order: [],
+              struckTeams: [],
+            },
+          ]);
+          setActivePicklistId("default");
+        }
+      }
+    };
+
+    void loadProjectDataFiles();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [selectedProject]);
+
+  React.useEffect(() => {
+    if (!selectedProject) {
+      return;
+    }
+
+    void invoke("write_project_data_file", {
+      projectId: selectedProject.id,
+      fileName: "metrics.json",
+      content: savedCycleMetrics,
+    });
+  }, [savedCycleMetrics, selectedProject]);
+
+  React.useEffect(() => {
+    if (!selectedProject) {
+      return;
+    }
+
+    void invoke("write_project_data_file", {
+      projectId: selectedProject.id,
+      fileName: "picklists.json",
+      content: picklists,
+    });
+  }, [picklists, selectedProject]);
 
   const filteredTeamNumbers = React.useMemo(() => {
     const term = teamSearch.trim().toLowerCase();
@@ -319,27 +801,121 @@ function App() {
     const tags = new Set<string>();
 
     for (const entry of jsonEntries) {
-      for (const [tag, value] of Object.entries(entry)) {
-        if (excludedDataTags.has(tag) || typeof value === "boolean") {
-          continue;
-        }
-
-        if (typeof value === "number" && Number.isFinite(value)) {
+      const numericMetrics = extractEntryNumericMetrics(entry);
+      for (const tag of Object.keys(numericMetrics)) {
+        if (!excludedDataTags.has(tag)) {
           tags.add(tag);
-          continue;
-        }
-
-        if (typeof value === "string" && value.trim() !== "") {
-          const parsed = Number(value);
-          if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
-            tags.add(tag);
-          }
         }
       }
     }
 
     return Array.from(tags).sort((left, right) => left.localeCompare(right));
   }, [excludedDataTags, jsonEntries]);
+
+  const dataTagGroups = React.useMemo(() => {
+    const grouped = new Map<string, Map<DataMetricVariant, DataTagVariantGroup>>();
+
+    for (const tag of allNumericTags) {
+      const phaseTag = splitMetricTag(tag);
+      if (!phaseTag) {
+        continue;
+      }
+
+      const parsed = parseMetricVariant(phaseTag.metric);
+      if (!parsed.variant) {
+        continue;
+      }
+
+      const baseGroup = grouped.get(parsed.base) ?? new Map<DataMetricVariant, DataTagVariantGroup>();
+      const existing = baseGroup.get(parsed.variant) ?? {
+        key: parsed.variant,
+        label: parsed.variant,
+        tagsByPhase: {},
+      };
+      existing.tagsByPhase[phaseTag.phase] = tag;
+      baseGroup.set(parsed.variant, existing);
+      grouped.set(parsed.base, baseGroup);
+    }
+
+    const variantOrder: Record<DataMetricVariant, number> = {
+      value: 0,
+      accuracy: 1,
+      attempts: 2,
+    };
+
+    return Array.from(grouped.entries())
+      .map(([base, variants]) => ({
+        base,
+        variants: Array.from(variants.values()).sort((left, right) => variantOrder[left.key] - variantOrder[right.key]),
+      }))
+      .sort((left, right) => left.base.localeCompare(right.base));
+  }, [allNumericTags]);
+
+  const basePhaseMetrics = React.useMemo(() => {
+    const baseToPhases = new Map<string, Set<"auto" | "teleop">>();
+
+    for (const tag of allNumericTags) {
+      if (tag.startsWith("auto.")) {
+        const base = tag.slice("auto.".length);
+        const phases = baseToPhases.get(base) ?? new Set<"auto" | "teleop">();
+        phases.add("auto");
+        baseToPhases.set(base, phases);
+        continue;
+      }
+
+      if (tag.startsWith("teleop.")) {
+        const base = tag.slice("teleop.".length);
+        const phases = baseToPhases.get(base) ?? new Set<"auto" | "teleop">();
+        phases.add("teleop");
+        baseToPhases.set(base, phases);
+      }
+    }
+
+    return Array.from(baseToPhases.entries())
+      .map(([base, phases]) => ({
+        base,
+        phases: Array.from(phases.values()).sort(),
+      }))
+      .sort((left, right) => left.base.localeCompare(right.base));
+  }, [allNumericTags]);
+
+  const resolveAxisTag = React.useCallback(
+    (axis: "x" | "y" | "y2") => {
+      const axisBase = axis === "x" ? selectedDataXBaseMetric : axis === "y" ? selectedDataYBaseMetric : selectedDataY2BaseMetric;
+      const axisVariant = axis === "x" ? selectedDataXVariant : axis === "y" ? selectedDataYVariant : selectedDataY2Variant;
+      const axisPhase = axis === "x" ? selectedDataXPhase : axis === "y" ? selectedDataYPhase : selectedDataY2Phase;
+
+      const group = dataTagGroups.find((item) => item.base === axisBase);
+      if (!group) {
+        return "";
+      }
+
+      const variant = group.variants.find((item) => item.key === axisVariant) ?? group.variants[0];
+      if (!variant) {
+        return "";
+      }
+
+      const exact = variant.tagsByPhase[axisPhase];
+      if (exact) {
+        return exact;
+      }
+
+      const fallbackPhase = (Object.keys(variant.tagsByPhase)[0] as "auto" | "teleop" | undefined) ?? "auto";
+      return variant.tagsByPhase[fallbackPhase] ?? buildTagFromSelection(fallbackPhase, group.base, variant.key);
+    },
+    [
+      dataTagGroups,
+      selectedDataXBaseMetric,
+      selectedDataXPhase,
+      selectedDataXVariant,
+      selectedDataY2BaseMetric,
+      selectedDataY2Phase,
+      selectedDataY2Variant,
+      selectedDataYBaseMetric,
+      selectedDataYPhase,
+      selectedDataYVariant,
+    ],
+  );
 
   React.useEffect(() => {
     setSelectedDataXTag((previous) => {
@@ -360,18 +936,140 @@ function App() {
     });
   }, [allNumericTags]);
 
-  const extractNumericValue = React.useCallback((entry: JsonEntry, tag: string) => {
-    const raw = entry[tag];
-    if (typeof raw === "number" && Number.isFinite(raw)) {
-      return raw;
-    }
-    if (typeof raw === "string" && raw.trim() !== "") {
-      const parsed = Number(raw);
-      if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
-        return parsed;
+  React.useEffect(() => {
+    const firstBase = dataTagGroups[0]?.base ?? "";
+    const firstVariant = dataTagGroups[0]?.variants[0]?.key ?? "value";
+
+    const normalizeAxisSelection = (
+      currentBase: string,
+      currentVariant: DataMetricVariant,
+      currentPhase: "auto" | "teleop",
+    ): { base: string; variant: DataMetricVariant; phase: "auto" | "teleop" } => {
+      const group = dataTagGroups.find((item) => item.base === currentBase) ?? dataTagGroups[0];
+      if (!group) {
+        return {
+          base: "",
+          variant: "value",
+          phase: "auto",
+        };
       }
+
+      const variant = group.variants.find((item) => item.key === currentVariant) ?? group.variants[0];
+      if (!variant) {
+        return {
+          base: group.base,
+          variant: "value",
+          phase: currentPhase,
+        };
+      }
+
+      const preferredPhase = variant.tagsByPhase[currentPhase] ? currentPhase : (Object.keys(variant.tagsByPhase)[0] as "auto" | "teleop" | undefined) ?? "auto";
+
+      return {
+        base: group.base,
+        variant: variant.key,
+        phase: preferredPhase,
+      };
+    };
+
+    const normalizedX = normalizeAxisSelection(selectedDataXBaseMetric, selectedDataXVariant, selectedDataXPhase);
+    const normalizedY = normalizeAxisSelection(selectedDataYBaseMetric, selectedDataYVariant, selectedDataYPhase);
+    const normalizedY2 = normalizeAxisSelection(selectedDataY2BaseMetric, selectedDataY2Variant, selectedDataY2Phase);
+
+    setSelectedDataXBaseMetric(normalizedX.base || firstBase);
+    setSelectedDataXVariant(normalizedX.variant || firstVariant);
+    setSelectedDataXPhase(normalizedX.phase);
+
+    setSelectedDataYBaseMetric(normalizedY.base || firstBase);
+    setSelectedDataYVariant(normalizedY.variant || firstVariant);
+    setSelectedDataYPhase(normalizedY.phase);
+
+    setSelectedDataY2BaseMetric(normalizedY2.base || firstBase);
+    setSelectedDataY2Variant(normalizedY2.variant || firstVariant);
+    setSelectedDataY2Phase(normalizedY2.phase);
+
+    setExpandedDataMetricBase((previous) => previous || firstBase);
+    setExpandedDataMetricVariant((previous) => previous ?? firstVariant);
+
+    setWeightedMetricSelections((previous) => {
+      if (previous.length > 0) {
+        return previous;
+      }
+
+      if (!firstBase) {
+        return [];
+      }
+
+      return [
+        {
+          id: `metric-${Date.now()}`,
+          baseMetric: firstBase,
+          phase: "auto",
+          weight: 1,
+        },
+      ];
+    });
+  }, [
+    dataTagGroups,
+    selectedDataXBaseMetric,
+    selectedDataXPhase,
+    selectedDataXVariant,
+    selectedDataY2BaseMetric,
+    selectedDataY2Phase,
+    selectedDataY2Variant,
+    selectedDataYBaseMetric,
+    selectedDataYPhase,
+    selectedDataYVariant,
+  ]);
+
+  React.useEffect(() => {
+    setSelectedDataXTag(resolveAxisTag("x"));
+  }, [resolveAxisTag]);
+
+  React.useEffect(() => {
+    setSelectedDataYTag(resolveAxisTag("y"));
+  }, [resolveAxisTag]);
+
+  React.useEffect(() => {
+    setSelectedDataYTagSecondary(resolveAxisTag("y2"));
+  }, [resolveAxisTag]);
+
+  const extractNumericValue = React.useCallback((entry: JsonEntry, tag: string) => {
+    const numericMetrics = extractEntryNumericMetrics(entry);
+    return numericMetrics[tag] ?? null;
+  }, []);
+
+  const extractTimelineEventTimes = React.useCallback((entry: JsonEntry, tag: string) => {
+    const [phase, metric] = tag.split(".");
+    if ((phase !== "auto" && phase !== "teleop") || !metric) {
+      return [] as number[];
     }
-    return null;
+
+    const phaseBucket = entry[phase];
+    if (!phaseBucket || typeof phaseBucket !== "object" || Array.isArray(phaseBucket)) {
+      return [] as number[];
+    }
+
+    const metricEntry = (phaseBucket as Record<string, unknown>)[metric];
+    if (!metricEntry || typeof metricEntry !== "object" || Array.isArray(metricEntry)) {
+      return [] as number[];
+    }
+
+    const events = (metricEntry as { events?: unknown }).events;
+    if (!Array.isArray(events)) {
+      return [] as number[];
+    }
+
+    return events
+      .map((event) => {
+        if (!event || typeof event !== "object" || Array.isArray(event)) {
+          return null;
+        }
+        const time = (event as Record<string, unknown>).time;
+        return typeof time === "number" && Number.isFinite(time) ? time : null;
+      })
+      .filter((time): time is number => time !== null)
+      .sort((left, right) => left - right);
   }, []);
 
   const parseAutoTeleopTag = React.useCallback((tag: string) => {
@@ -493,6 +1191,60 @@ function App() {
       .sort((left, right) => right.totalValue - left.totalValue);
   }, [extractNumericValue, jsonEntries, selectedDataYTag, selectedDataYTagSecondary]);
 
+  const weightedDataRows = React.useMemo(() => {
+    if (weightedMetricSelections.length === 0) {
+      return [] as Array<{ team: string; weightedScore: number; metricBreakdown: Record<string, number> }>;
+    }
+
+    const grouped = new Map<string, { weightedSum: number; metricSums: Map<string, { sum: number; count: number; weight: number }> }>();
+
+    for (const entry of jsonEntries) {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "Unknown";
+      if (!team) {
+        continue;
+      }
+
+      const current = grouped.get(team) ?? { weightedSum: 0, metricSums: new Map<string, { sum: number; count: number; weight: number }>() };
+
+      for (const selection of weightedMetricSelections) {
+        const tag = `${selection.phase}.${selection.baseMetric}`;
+        const value = extractNumericValue(entry, tag);
+        if (value === null) {
+          continue;
+        }
+
+        const stats = current.metricSums.get(tag) ?? { sum: 0, count: 0, weight: selection.weight };
+        stats.sum += value;
+        stats.count += 1;
+        stats.weight = selection.weight;
+        current.metricSums.set(tag, stats);
+      }
+
+      grouped.set(team, current);
+    }
+
+    const rows = Array.from(grouped.entries()).map(([team, stats]) => {
+      const breakdown: Record<string, number> = {};
+      let weightedScore = 0;
+
+      for (const [tag, metricStats] of stats.metricSums.entries()) {
+        const average = metricStats.count > 0 ? metricStats.sum / metricStats.count : 0;
+        const weighted = average * metricStats.weight;
+        breakdown[tag] = weighted;
+        weightedScore += weighted;
+      }
+
+      return {
+        team,
+        weightedScore,
+        metricBreakdown: breakdown,
+      };
+    });
+
+    return rows.sort((left, right) => right.weightedScore - left.weightedScore);
+  }, [extractNumericValue, jsonEntries, weightedMetricSelections]);
+
   const teamAverages = React.useMemo(() => {
     if (!statsTeam) {
       return [] as Array<{ tag: string; average: number }>;
@@ -504,30 +1256,12 @@ function App() {
     });
 
     const totals = new Map<string, { sum: number; count: number }>();
-    const excludedTags = excludedDataTags;
 
     for (const entry of relevantEntries) {
-      for (const [tag, value] of Object.entries(entry)) {
-        if (excludedTags.has(tag)) {
-          continue;
-        }
+      const numericMetrics = extractEntryNumericMetrics(entry);
 
-        if (typeof value === "boolean") {
-          continue;
-        }
-
-        let numericValue: number | null = null;
-
-        if (typeof value === "number" && Number.isFinite(value)) {
-          numericValue = value;
-        } else if (typeof value === "string" && value.trim() !== "") {
-          const parsed = Number(value);
-          if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
-            numericValue = parsed;
-          }
-        }
-
-        if (numericValue === null) {
+      for (const [tag, numericValue] of Object.entries(numericMetrics)) {
+        if (excludedDataTags.has(tag)) {
           continue;
         }
 
@@ -543,7 +1277,22 @@ function App() {
         tag,
         average: stats.count > 0 ? stats.sum / stats.count : 0,
       }))
-      .sort((left, right) => left.tag.localeCompare(right.tag));
+      .filter((item) => {
+        if (item.tag === "bricked") {
+          return false;
+        }
+
+        if (item.tag.endsWith(".accuracy") || item.tag.endsWith(".attempts") || item.tag.endsWith(".fails") || item.tag.endsWith(".successes")) {
+          return false;
+        }
+
+        if (item.tag.toLowerCase().includes("defensetimeheld") || item.tag.toLowerCase().includes("totaltimeheld")) {
+          return false;
+        }
+
+        return true;
+      })
+        .sort((left, right) => compareMetricTags(left.tag, right.tag));
   }, [excludedDataTags, jsonEntries, statsTeam]);
 
   const selectedTeamMatchCount = React.useMemo(() => {
@@ -556,6 +1305,148 @@ function App() {
       return typeof value === "string" ? value.trim() === statsTeam : typeof value === "number" ? String(value) === statsTeam : false;
     }).length;
   }, [jsonEntries, statsTeam]);
+
+  const selectedTeamEntries = React.useMemo(() => {
+    if (!statsTeam) {
+      return [] as JsonEntry[];
+    }
+
+    return jsonEntries.filter((entry) => {
+      const value = entry.team;
+      return typeof value === "string" ? value.trim() === statsTeam : typeof value === "number" ? String(value) === statsTeam : false;
+    });
+  }, [jsonEntries, statsTeam]);
+
+  const selectedTeamAccuracyStats = React.useMemo(() => {
+    const stats: Array<{ tag: string; successes: number; fails: number; accuracy: number }> = [];
+
+    for (const entry of selectedTeamEntries) {
+      for (const phase of ["auto", "teleop"] as const) {
+        const phaseBucket = entry[phase];
+        if (!phaseBucket || typeof phaseBucket !== "object" || Array.isArray(phaseBucket)) {
+          continue;
+        }
+
+        for (const [metric, value] of Object.entries(phaseBucket as Record<string, unknown>)) {
+          if (!value || typeof value !== "object" || Array.isArray(value)) {
+            continue;
+          }
+
+          const item = value as Record<string, unknown>;
+          const successes = typeof item.successes === "number" ? item.successes : null;
+          const fails = typeof item.fails === "number" ? item.fails : null;
+          if (successes === null && fails === null) {
+            continue;
+          }
+
+          const tag = `${phase}.${metric}`;
+          const existing = stats.find((row) => row.tag === tag);
+          if (existing) {
+            existing.successes += successes ?? 0;
+            existing.fails += fails ?? 0;
+            const attempts = existing.successes + existing.fails;
+            existing.accuracy = attempts > 0 ? existing.successes / attempts : 0;
+          } else {
+            const nextSuccesses = successes ?? 0;
+            const nextFails = fails ?? 0;
+            const attempts = nextSuccesses + nextFails;
+            stats.push({ tag, successes: nextSuccesses, fails: nextFails, accuracy: attempts > 0 ? nextSuccesses / attempts : 0 });
+          }
+        }
+      }
+    }
+
+    return stats.sort((left, right) => right.accuracy - left.accuracy);
+  }, [selectedTeamEntries]);
+
+  const selectedTeamToggleStats = React.useMemo(() => {
+    const toggleTags = ["bricked"];
+    return toggleTags.map((tag) => {
+      let trueCount = 0;
+      let total = 0;
+      for (const entry of selectedTeamEntries) {
+        const value = entry[tag];
+        if (typeof value === "boolean") {
+          total += 1;
+          if (value) {
+            trueCount += 1;
+          }
+        }
+      }
+      return { tag, trueCount, total, rate: total > 0 ? trueCount / total : 0 };
+    });
+  }, [selectedTeamEntries]);
+
+  const selectedTeamHeldStats = React.useMemo(() => {
+    const tags = ["auto.defense", "teleop.defense", "auto.defenseTimeHeld", "teleop.defenseTimeHeld"];
+    return tags
+      .map((tag) => {
+        let sum = 0;
+        let count = 0;
+        for (const entry of selectedTeamEntries) {
+          const value = extractNumericValue(entry, tag);
+          if (value !== null) {
+            sum += value;
+            count += 1;
+          }
+        }
+        return { tag, average: count > 0 ? sum / count : 0, count };
+      })
+      .filter((item) => item.count > 0);
+  }, [extractNumericValue, selectedTeamEntries]);
+
+  const selectedTeamNotes = React.useMemo(() => {
+    const rows: Array<{ match: number; scoutType: string; scouter: string; good: string; bad: string; area: string }> = [];
+
+    for (const entry of selectedTeamEntries) {
+      const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : 0;
+      const scouter = typeof entry.scouter === "string" ? entry.scouter : "Unknown";
+      const ft = Array.isArray(entry.ft) && typeof entry.ft[0] === "number" ? entry.ft[0] : 0;
+      rows.push({
+        match: Number.isFinite(matchValue) ? matchValue : 0,
+        scoutType: ft === 1 ? "qualitative" : ft === 2 ? "pit" : "match",
+        scouter,
+        good: typeof entry.good === "string" ? entry.good : "",
+        bad: typeof entry.bad === "string" ? entry.bad : "",
+        area: typeof entry.area === "string" ? entry.area : "",
+      });
+    }
+
+    return rows.sort((left, right) => right.match - left.match);
+  }, [selectedTeamEntries]);
+
+  const filteredSelectedTeamNotes = React.useMemo(() => {
+    const term = teamNoteSearch.trim().toLowerCase();
+    if (!term) {
+      return selectedTeamNotes;
+    }
+
+    return selectedTeamNotes.filter((row) => `${row.good} ${row.bad} ${row.area}`.toLowerCase().includes(term));
+  }, [selectedTeamNotes, teamNoteSearch]);
+
+  const selectedTeamHasEventTracking = React.useMemo(() => {
+    for (const entry of selectedTeamEntries) {
+      for (const phase of ["auto", "teleop"] as const) {
+        const phaseBucket = entry[phase];
+        if (!phaseBucket || typeof phaseBucket !== "object" || Array.isArray(phaseBucket)) {
+          continue;
+        }
+
+        for (const metricValue of Object.values(phaseBucket as Record<string, unknown>)) {
+          if (!metricValue || typeof metricValue !== "object" || Array.isArray(metricValue)) {
+            continue;
+          }
+
+          const events = (metricValue as { events?: unknown }).events;
+          if (Array.isArray(events) && events.length > 0) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }, [selectedTeamEntries]);
 
   const buildTeamSeriesByTag = React.useCallback(
     (team: string) => {
@@ -586,28 +1477,49 @@ function App() {
         const scouterValue = entry.scouter;
         const scouterName = typeof scouterValue === "string" && scouterValue.trim() ? scouterValue.trim() : "Unknown";
 
-        for (const [tag, value] of Object.entries(entry)) {
-          if (excludedDataTags.has(tag) || typeof value === "boolean") {
-            continue;
-          }
-
-          let numericValue: number | null = null;
-
-          if (typeof value === "number" && Number.isFinite(value)) {
-            numericValue = value;
-          } else if (typeof value === "string" && value.trim() !== "") {
-            const parsedValue = Number(value);
-            if (!Number.isNaN(parsedValue) && Number.isFinite(parsedValue)) {
-              numericValue = parsedValue;
-            }
-          }
-
-          if (numericValue === null) {
+        const numericMetrics = extractEntryNumericMetrics(entry);
+        for (const [tag, numericValue] of Object.entries(numericMetrics)) {
+          if (excludedDataTags.has(tag)) {
             continue;
           }
 
           const points = series.get(tag) ?? [];
           points.push({ match: matchNumber, value: numericValue, scouter: scouterName });
+          series.set(tag, points);
+        }
+
+        for (const cycleMetric of savedCycleMetrics) {
+          const starts = extractTimelineEventTimes(entry, cycleMetric.startTag);
+          const ends = extractTimelineEventTimes(entry, cycleMetric.endTag);
+
+          if (starts.length === 0 || ends.length === 0) {
+            continue;
+          }
+
+          const deltas: number[] = [];
+          let endIndex = 0;
+
+          for (const startTime of starts) {
+            while (endIndex < ends.length && ends[endIndex] <= startTime) {
+              endIndex += 1;
+            }
+
+            if (endIndex >= ends.length) {
+              break;
+            }
+
+            deltas.push(ends[endIndex] - startTime);
+            endIndex += 1;
+          }
+
+          if (deltas.length === 0) {
+            continue;
+          }
+
+          const averageCycle = deltas.reduce((sum, value) => sum + value, 0) / deltas.length;
+          const tag = `cycle.${cycleMetric.name}`;
+          const points = series.get(tag) ?? [];
+          points.push({ match: matchNumber, value: averageCycle, scouter: scouterName });
           series.set(tag, points);
         }
       }
@@ -619,7 +1531,7 @@ function App() {
 
       return series;
     },
-    [excludedDataTags, jsonEntries],
+    [excludedDataTags, extractTimelineEventTimes, jsonEntries, savedCycleMetrics],
   );
 
   const teamSeriesByTag = React.useMemo(() => {
@@ -627,16 +1539,10 @@ function App() {
   }, [activeTeam, buildTeamSeriesByTag]);
 
   const availableTeamTags = React.useMemo(() => {
-    return Array.from(teamSeriesByTag.keys()).sort((left, right) => left.localeCompare(right));
+    return Array.from(teamSeriesByTag.keys()).sort(compareMetricTags);
   }, [teamSeriesByTag]);
 
   React.useEffect(() => {
-    setTeamTagOrder((previous) => {
-      const present = previous.filter((tag) => availableTeamTags.includes(tag));
-      const additions = availableTeamTags.filter((tag) => !present.includes(tag));
-      return [...present, ...additions];
-    });
-
     setSelectedTeamTag((previous) => {
       if (previous && availableTeamTags.includes(previous)) {
         return previous;
@@ -646,24 +1552,35 @@ function App() {
   }, [availableTeamTags]);
 
   const orderedTeamTags = React.useMemo(() => {
-    const seen = new Set<string>();
-    const ordered: string[] = [];
+    return [...availableTeamTags].sort(compareMetricTags);
+  }, [availableTeamTags]);
 
-    for (const tag of teamTagOrder) {
-      if (availableTeamTags.includes(tag) && !seen.has(tag)) {
-        seen.add(tag);
-        ordered.push(tag);
+  const teamTagGroups = React.useMemo(() => {
+    const groups = new Map<string, { base: string; tags: string[] }>();
+
+    for (const tag of orderedTeamTags) {
+      const parsed = splitMetricTag(tag);
+      if (!parsed) {
+        const existing = groups.get(tag) ?? { base: tag, tags: [] };
+        existing.tags.push(tag);
+        groups.set(tag, existing);
+        continue;
       }
+
+      const existing = groups.get(parsed.metric) ?? { base: parsed.metric, tags: [] };
+      existing.tags.push(tag);
+      groups.set(parsed.metric, existing);
     }
 
-    for (const tag of availableTeamTags) {
-      if (!seen.has(tag)) {
-        ordered.push(tag);
-      }
-    }
+    return Array.from(groups.values()).sort((left, right) => left.base.localeCompare(right.base));
+  }, [orderedTeamTags]);
 
-    return ordered;
-  }, [availableTeamTags, teamTagOrder]);
+  React.useEffect(() => {
+    const parsed = splitMetricTag(selectedTeamTag);
+    const fallbackBase = parsed?.metric ?? teamTagGroups[0]?.base ?? "";
+
+    setExpandedTeamMetricBase((previous) => previous || fallbackBase);
+  }, [selectedTeamTag, teamTagGroups]);
 
   const selectedTeamSeries = React.useMemo(() => {
     if (!selectedTeamTag) {
@@ -815,25 +1732,244 @@ function App() {
     return dataBarRows.findIndex((row) => row.team.toLowerCase().includes(normalizedDataTeamSearch));
   }, [dataBarRows, normalizedDataTeamSearch]);
 
-  const moveTeamTag = React.useCallback((fromTag: string, toTag: string) => {
-    if (fromTag === toTag) {
+  const dataTagActiveAxis = React.useMemo<"x" | "y" | "y2">(() => {
+    if (dataGraphType === "bar" && activeDataAxis === "y2") {
+      return "y2";
+    }
+
+    if (activeDataAxis === "x") {
+      return "x";
+    }
+
+    return "y";
+  }, [activeDataAxis, dataGraphType]);
+
+  const selectedDataBaseForActiveAxis = React.useMemo(() => {
+    if (dataTagActiveAxis === "x") {
+      return selectedDataXBaseMetric;
+    }
+    if (dataTagActiveAxis === "y2") {
+      return selectedDataY2BaseMetric;
+    }
+    return selectedDataYBaseMetric;
+  }, [dataTagActiveAxis, selectedDataXBaseMetric, selectedDataY2BaseMetric, selectedDataYBaseMetric]);
+
+  const selectedDataVariantForActiveAxis = React.useMemo(() => {
+    if (dataTagActiveAxis === "x") {
+      return selectedDataXVariant;
+    }
+    if (dataTagActiveAxis === "y2") {
+      return selectedDataY2Variant;
+    }
+    return selectedDataYVariant;
+  }, [dataTagActiveAxis, selectedDataXVariant, selectedDataY2Variant, selectedDataYVariant]);
+
+  const selectedDataPhaseForActiveAxis = React.useMemo(() => {
+    if (dataTagActiveAxis === "x") {
+      return selectedDataXPhase;
+    }
+    if (dataTagActiveAxis === "y2") {
+      return selectedDataY2Phase;
+    }
+    return selectedDataYPhase;
+  }, [dataTagActiveAxis, selectedDataXPhase, selectedDataY2Phase, selectedDataYPhase]);
+
+  const teamDefaultMatchByTeam = React.useMemo(() => {
+    const next = new Map<string, number>();
+
+    for (const entry of jsonEntries) {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+      if (!team) {
+        continue;
+      }
+
+      const matchValue = entry.match;
+      const matchNumber = typeof matchValue === "number" ? matchValue : typeof matchValue === "string" ? Number(matchValue) : NaN;
+      if (!Number.isFinite(matchNumber)) {
+        continue;
+      }
+
+      const previous = next.get(team);
+      if (previous === undefined || matchNumber > previous) {
+        next.set(team, matchNumber);
+      }
+    }
+
+    return next;
+  }, [jsonEntries]);
+
+  const picklistSortedTags = React.useMemo(() => {
+    return [...allNumericTags].sort(compareMetricTags);
+  }, [allNumericTags]);
+
+  const picklistFilteredTags = React.useMemo(() => {
+    const normalized = picklistMetricSearch.trim().toLowerCase();
+    if (!normalized) {
+      return picklistSortedTags;
+    }
+
+    return picklistSortedTags.filter((tag) => formatMetricTagLabel(tag).toLowerCase().includes(normalized));
+  }, [picklistMetricSearch, picklistSortedTags]);
+
+  const activePicklist = React.useMemo(() => {
+    return picklists.find((picklist) => picklist.id === activePicklistId) ?? picklists[0] ?? null;
+  }, [activePicklistId, picklists]);
+
+  const picklistRows = React.useMemo(() => {
+    if (!activePicklist) {
+      return [] as Array<{ team: string; score: number }>;
+    }
+
+    const grouped = new Map<string, { score: number; counts: Map<string, { sum: number; count: number }> }>();
+
+    for (const entry of jsonEntries) {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+      if (!team) {
+        continue;
+      }
+
+      const current = grouped.get(team) ?? { score: 0, counts: new Map<string, { sum: number; count: number }>() };
+      const numericMetrics = extractEntryNumericMetrics(entry);
+
+      for (const [metricTag, weight] of Object.entries(activePicklist.metricWeights)) {
+        const value = numericMetrics[metricTag];
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          continue;
+        }
+
+        const stats = current.counts.get(metricTag) ?? { sum: 0, count: 0 };
+        stats.sum += value * weight;
+        stats.count += 1;
+        current.counts.set(metricTag, stats);
+      }
+
+      grouped.set(team, current);
+    }
+
+    const rows = Array.from(grouped.entries()).map(([team, stats]) => {
+      let score = 0;
+      for (const metricStats of stats.counts.values()) {
+        score += metricStats.count > 0 ? metricStats.sum / metricStats.count : 0;
+      }
+      return { team, score };
+    });
+
+    const ranked = rows.sort((left, right) => right.score - left.score);
+    if (activePicklist.order.length === 0) {
+      return ranked;
+    }
+
+    const orderIndex = new Map(activePicklist.order.map((team, index) => [team, index]));
+    return [...ranked].sort((left, right) => {
+      const leftOrder = orderIndex.get(left.team);
+      const rightOrder = orderIndex.get(right.team);
+
+      if (leftOrder !== undefined && rightOrder !== undefined) {
+        return leftOrder - rightOrder;
+      }
+      if (leftOrder !== undefined) {
+        return -1;
+      }
+      if (rightOrder !== undefined) {
+        return 1;
+      }
+      return right.score - left.score;
+    });
+  }, [activePicklist, jsonEntries]);
+
+  const updateActivePicklist = React.useCallback(
+    (updater: (picklist: SavedPicklist) => SavedPicklist) => {
+      setPicklists((previous) =>
+        previous.map((picklist) => {
+          if (picklist.id !== activePicklistId) {
+            return picklist;
+          }
+          return updater(picklist);
+        }),
+      );
+    },
+    [activePicklistId],
+  );
+
+  const setPicklistMetricWeight = React.useCallback(
+    (metricTag: string, nextWeight: number) => {
+      updateActivePicklist((picklist) => ({
+        ...picklist,
+        metricWeights: {
+          ...picklist.metricWeights,
+          [metricTag]: nextWeight,
+        },
+      }));
+    },
+    [updateActivePicklist],
+  );
+
+  const togglePicklistStrike = React.useCallback(
+    (team: string) => {
+      updateActivePicklist((picklist) => {
+        const struck = new Set(picklist.struckTeams);
+        if (struck.has(team)) {
+          struck.delete(team);
+        } else {
+          struck.add(team);
+        }
+
+        return {
+          ...picklist,
+          struckTeams: Array.from(struck.values()),
+        };
+      });
+    },
+    [updateActivePicklist],
+  );
+
+  const createNewPicklist = React.useCallback(() => {
+    const name = newPicklistName.trim();
+    if (!name) {
       return;
     }
 
-    setTeamTagOrder((previous) => {
-      const next = [...previous];
-      const fromIndex = next.indexOf(fromTag);
-      const toIndex = next.indexOf(toTag);
+    const next: SavedPicklist = {
+      id: `picklist-${Date.now()}`,
+      name,
+      metricWeights: activePicklist?.metricWeights ?? {},
+      order: [],
+      struckTeams: [],
+    };
 
-      if (fromIndex < 0 || toIndex < 0) {
-        return previous;
+    setPicklists((previous) => [...previous, next]);
+    setActivePicklistId(next.id);
+    setNewPicklistName("");
+  }, [activePicklist?.metricWeights, newPicklistName]);
+
+  const movePicklistTeam = React.useCallback(
+    (fromTeam: string, toTeam: string) => {
+      if (fromTeam === toTeam) {
+        return;
       }
 
-      next.splice(fromIndex, 1);
-      next.splice(toIndex, 0, fromTag);
-      return next;
-    });
-  }, []);
+      updateActivePicklist((picklist) => {
+        const currentOrder = picklist.order.length > 0 ? [...picklist.order] : picklistRows.map((row) => row.team);
+        const fromIndex = currentOrder.indexOf(fromTeam);
+        const toIndex = currentOrder.indexOf(toTeam);
+
+        if (fromIndex < 0 || toIndex < 0) {
+          return picklist;
+        }
+
+        currentOrder.splice(fromIndex, 1);
+        currentOrder.splice(toIndex, 0, fromTeam);
+
+        return {
+          ...picklist,
+          order: currentOrder,
+        };
+      });
+    },
+    [picklistRows, updateActivePicklist],
+  );
 
   const displayedProjects = React.useMemo(() => {
     if (!workspace) {
@@ -860,6 +1996,26 @@ function App() {
     window.location.hash = buildTeamHash(projectId, team);
   }, []);
 
+  const navigateMatch = React.useCallback((projectId: string, team: string, match: number) => {
+    window.location.hash = buildMatchHash(projectId, team, match);
+  }, []);
+
+  const openMatchFromDataTeam = React.useCallback(
+    (team: string) => {
+      if (!selectedProject?.id) {
+        return;
+      }
+
+      const matchNumber = teamDefaultMatchByTeam.get(team);
+      if (matchNumber === undefined) {
+        return;
+      }
+
+      navigateMatch(selectedProject.id, team, matchNumber);
+    },
+    [navigateMatch, selectedProject?.id, teamDefaultMatchByTeam],
+  );
+
   const navigateViewer = React.useCallback((project?: WorkspaceProject) => {
     window.location.hash = buildViewerHash(project);
   }, []);
@@ -871,19 +2027,290 @@ function App() {
       return;
     }
 
+    const contentHash = createProjectContentHash.trim();
+    if (!contentHash) {
+      setWorkspaceError("Content hash is required to create a project.");
+      return;
+    }
+
     setIsCreatingProject(true);
 
     try {
+      const validation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+        contentHash,
+        expectedScoutType: "match",
+      });
+
+      if (!validation.valid) {
+        setWorkspaceError(`Could not create project: ${validation.message}`);
+        return;
+      }
+
       const project = await invoke<WorkspaceProject>("create_goonhq_project", { name });
+
+      const createdConfig: ProjectConfig = {
+        matchContentHash: contentHash,
+        qualitativeContentHash: "",
+        pitContentHash: "",
+        backgroundImage: validation.background_image ?? null,
+        backgroundLocation: validation.background_location ?? null,
+        fieldMapping: validation.field_mapping ?? null,
+        layoutPayload: validation.payload ?? null,
+      };
+
+      await invoke("save_project_config", {
+        projectId: project.id,
+        config: createdConfig,
+      });
+
+      const persistedConfig = await invoke<ProjectConfig>("get_project_config", {
+        projectId: project.id,
+      });
+
+      if ((persistedConfig.matchContentHash ?? "").trim() !== contentHash) {
+        throw new Error("Project config did not persist match content hash.");
+      }
+
+      setProjectConfig(persistedConfig);
+      if (isScoutingFieldMapping(persistedConfig.fieldMapping)) {
+        setDecodeFieldMapping(persistedConfig.fieldMapping);
+      }
+
       await refreshWorkspace();
       setIsCreateDialogOpen(false);
+      setCreateProjectName("Untitled Project");
+      setCreateProjectContentHash("");
       window.location.hash = buildProjectHash(project.id);
     } catch (error) {
       setWorkspaceError(`Could not create project: ${String(error)}`);
     } finally {
       setIsCreatingProject(false);
     }
-  }, [createProjectName, refreshWorkspace]);
+  }, [createProjectContentHash, createProjectName, refreshWorkspace]);
+
+  const validateAndSaveConfigHash = React.useCallback(
+    async (kind: "match" | "qualitative" | "pit") => {
+      if (!selectedProject) {
+        return;
+      }
+
+      const hashValue =
+        kind === "match"
+          ? projectConfig.matchContentHash.trim()
+          : kind === "qualitative"
+            ? projectConfig.qualitativeContentHash.trim()
+            : projectConfig.pitContentHash.trim();
+
+      setIsSavingConfig(true);
+
+      try {
+        if (hashValue.length > 0) {
+          const validation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+            contentHash: hashValue,
+            expectedScoutType: kind,
+          });
+
+          if (!validation.valid) {
+            setConfigStatus(validation.message);
+            return;
+          }
+
+          const nextConfig: ProjectConfig = {
+            ...projectConfig,
+            backgroundImage: validation.background_image ?? projectConfig.backgroundImage ?? null,
+            backgroundLocation: validation.background_location ?? projectConfig.backgroundLocation ?? null,
+            fieldMapping: validation.field_mapping ?? projectConfig.fieldMapping ?? null,
+            layoutPayload: validation.payload ?? projectConfig.layoutPayload ?? null,
+          };
+
+          await invoke("save_project_config", {
+            projectId: selectedProject.id,
+            config: nextConfig,
+          });
+
+          setProjectConfig(nextConfig);
+          setConfigStatus(`${kind} hash validated and saved.`);
+          return;
+        }
+
+        await invoke("save_project_config", {
+          projectId: selectedProject.id,
+          config: projectConfig,
+        });
+        setConfigStatus(`${kind} hash cleared and saved.`);
+      } catch (error) {
+        setConfigStatus(`Unable to save ${kind} hash: ${String(error)}`);
+      } finally {
+        setIsSavingConfig(false);
+      }
+    },
+    [projectConfig, selectedProject],
+  );
+
+  const handleSetRootFolder = React.useCallback(async () => {
+    if (isSettingRootFolder) {
+      return;
+    }
+
+    setIsSettingRootFolder(true);
+
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+      });
+
+      if (typeof selected !== "string") {
+        return;
+      }
+
+      await invoke("set_workspace_root", {
+        rootPath: selected,
+      });
+
+      await refreshWorkspace();
+      setWorkspaceError("");
+    } catch (error) {
+      setWorkspaceError(`Unable to set root folder: ${String(error)}`);
+    } finally {
+      setIsSettingRootFolder(false);
+    }
+  }, [isSettingRootFolder, refreshWorkspace]);
+
+  const handleDebugValidateHash = React.useCallback(async () => {
+    const hash = debugContentHash.trim();
+    if (!hash) {
+      setDebugMessage("Enter a content hash first.");
+      setDebugResult(null);
+      return;
+    }
+
+    setIsRunningDebugValidation(true);
+    setDebugMessage("Validating hash with backend...");
+
+    try {
+      const result = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+        contentHash: hash,
+        expectedScoutType: debugScoutType,
+      });
+
+      setDebugResult(result);
+      setDebugMessage(result.valid ? "Backend connection OK. Hash is valid." : `Backend reachable. ${result.message}`);
+    } catch (error) {
+      setDebugResult(null);
+      setDebugMessage(`Backend validation failed: ${String(error)}`);
+    } finally {
+      setIsRunningDebugValidation(false);
+    }
+  }, [debugContentHash, debugScoutType]);
+
+  const parseEntryMatchNumber = React.useCallback((entry: JsonEntry): number | null => {
+    const matchValue = entry.match;
+    if (typeof matchValue === "number" && Number.isFinite(matchValue)) {
+      return matchValue;
+    }
+    if (typeof matchValue === "string" && matchValue.trim() !== "") {
+      const parsed = Number(matchValue);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return null;
+  }, []);
+
+  const matchEntriesForRoute = React.useMemo(() => {
+    if (route.kind !== "match") {
+      return [] as JsonEntry[];
+    }
+
+    return jsonEntries.filter((entry) => parseEntryMatchNumber(entry) === route.match);
+  }, [jsonEntries, parseEntryMatchNumber, route]);
+
+  const selectedMatchEntry = React.useMemo(() => {
+    if (route.kind !== "match") {
+      return null;
+    }
+
+    return (
+      matchEntriesForRoute.find((entry) => {
+        const teamValue = entry.team;
+        const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+        return team === route.team;
+      }) ?? null
+    );
+  }, [matchEntriesForRoute, route]);
+
+  const otherMatchTeams = React.useMemo(() => {
+    if (route.kind !== "match") {
+      return [] as string[];
+    }
+
+    const teams = new Set<string>();
+    for (const entry of matchEntriesForRoute) {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+      if (!team || team === route.team) {
+        continue;
+      }
+      teams.add(team);
+    }
+
+    return Array.from(teams).sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  }, [matchEntriesForRoute, route]);
+
+  const selectedMatchTimelineEvents = React.useMemo(() => {
+    if (!selectedMatchEntry) {
+      return [] as Array<{ phase: "auto" | "teleop"; metric: string; time: number; valueLabel: string }>;
+    }
+
+    const timelineEvents: Array<{ phase: "auto" | "teleop"; metric: string; time: number; valueLabel: string }> = [];
+
+    for (const phase of ["auto", "teleop"] as const) {
+      const bucket = selectedMatchEntry[phase];
+      if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) {
+        continue;
+      }
+
+      for (const [metric, metricData] of Object.entries(bucket as Record<string, unknown>)) {
+        if (!metricData || typeof metricData !== "object" || Array.isArray(metricData)) {
+          continue;
+        }
+
+        const events = (metricData as { events?: unknown }).events;
+        if (!Array.isArray(events)) {
+          continue;
+        }
+
+        for (const event of events) {
+          if (!event || typeof event !== "object" || Array.isArray(event)) {
+            continue;
+          }
+
+          const eventObject = event as Record<string, unknown>;
+          const timeValue = eventObject.time;
+          if (typeof timeValue !== "number" || !Number.isFinite(timeValue)) {
+            continue;
+          }
+
+          const valueLabel =
+            typeof eventObject.value === "number"
+              ? `+${eventObject.value}${typeof eventObject.result === "string" ? ` (${eventObject.result})` : ""}`
+              : typeof eventObject.duration === "number"
+                ? `${eventObject.duration.toFixed(2)}s hold`
+                : "event";
+
+          timelineEvents.push({
+            phase,
+            metric,
+            time: timeValue,
+            valueLabel,
+          });
+        }
+      }
+    }
+
+    return timelineEvents.sort((left, right) => left.time - right.time);
+  }, [selectedMatchEntry]);
 
   const viewerPath = route.kind === "viewer" ? selectedProject?.json_file_path ?? "" : "";
 
@@ -907,7 +2334,7 @@ function App() {
           <div className="text-sm text-white/65">JSON Viewer</div>
         </header>
 
-        <JsonViewerPage initialPath={viewerPath} projectId={selectedProject?.id ?? route.projectId} />
+        <JsonViewerPage initialPath={viewerPath} projectId={selectedProject?.id ?? route.projectId} fieldMapping={decodeFieldMapping} />
       </div>
     );
   }
@@ -966,7 +2393,7 @@ function App() {
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                   {teamAverages.map((item) => (
                     <div key={item.tag} className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
-                      <p className="text-xs uppercase tracking-wide text-white/55">{item.tag}</p>
+                      <p className="text-xs uppercase tracking-wide text-white/55">{formatMetricTagLabel(item.tag)}</p>
                       <p className="mt-2 text-2xl font-semibold text-white">{item.average.toFixed(2)}</p>
                     </div>
                   ))}
@@ -988,40 +2415,55 @@ function App() {
                 <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
                 <aside className="rounded-xl border border-white/10 bg-slate-900/50 p-3 xl:col-span-3">
                   <p className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-white/55">Data Tags</p>
-                  <p className="mb-3 text-xs text-white/50">Click a tag to graph it. Drag to reorder.</p>
+                  <p className="mb-3 text-xs text-white/50">Choose a stat, then choose auto or teleop.</p>
 
-                  {orderedTeamTags.length === 0 ? (
+                  {teamTagGroups.length === 0 ? (
                     <p className="text-sm text-white/60">No numeric tags available.</p>
                   ) : (
-                    <div className="space-y-2">
-                      {orderedTeamTags.map((tag) => {
-                        const selected = selectedTeamTag === tag;
+                    <div className="max-h-[calc(100dvh-360px)] space-y-2 overflow-y-auto pr-1">
+                      {teamTagGroups.map((group) => {
+                        const isExpanded = expandedTeamMetricBase === group.base;
+                        const selectedInGroup = group.tags.includes(selectedTeamTag);
+
                         return (
-                          <button
-                            key={tag}
-                            type="button"
-                            draggable
-                            onDragStart={() => setDraggingTeamTag(tag)}
-                            onDragOver={(event) => {
-                              event.preventDefault();
-                            }}
-                            onDrop={(event) => {
-                              event.preventDefault();
-                              if (draggingTeamTag) {
-                                moveTeamTag(draggingTeamTag, tag);
-                              }
-                              setDraggingTeamTag(null);
-                            }}
-                            onDragEnd={() => setDraggingTeamTag(null)}
-                            onClick={() => setSelectedTeamTag(tag)}
-                            className={`w-full rounded-lg border px-3 py-2 text-left text-sm font-medium transition ${
-                              selected
-                                ? "border-blue-400/70 bg-blue-600/20 text-white"
-                                : "border-white/15 bg-slate-900/70 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
-                            }`}
-                          >
-                            {tag}
-                          </button>
+                          <div key={group.base} className="rounded-lg border border-white/15 bg-slate-900/70 p-2">
+                            <button
+                              type="button"
+                              onClick={() => setExpandedTeamMetricBase((previous) => (previous === group.base ? "" : group.base))}
+                              className={`w-full rounded-md border px-3 py-2 text-left text-sm font-medium transition ${
+                                selectedInGroup
+                                  ? "border-blue-400/70 bg-blue-600/20 text-white"
+                                  : "border-white/15 bg-slate-900 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
+                              }`}
+                            >
+                              {group.base}
+                            </button>
+
+                            {isExpanded ? (
+                              <div className="mt-2 grid grid-cols-2 gap-2">
+                                {group.tags.sort(compareMetricTags).map((tag) => {
+                                  const parsed = splitMetricTag(tag);
+                                  const phaseLabel = parsed ? parsed.phase : tag;
+                                  const selected = selectedTeamTag === tag;
+
+                                  return (
+                                    <button
+                                      key={tag}
+                                      type="button"
+                                      onClick={() => setSelectedTeamTag(tag)}
+                                      className={`rounded-md border px-2 py-1.5 text-xs font-medium transition ${
+                                        selected
+                                          ? "border-blue-400/70 bg-blue-600/20 text-white"
+                                          : "border-white/15 bg-slate-950/70 text-white/85 hover:border-blue-400/60 hover:bg-blue-600/20"
+                                      }`}
+                                    >
+                                      {phaseLabel}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            ) : null}
+                          </div>
                         );
                       })}
                     </div>
@@ -1032,7 +2474,7 @@ function App() {
                   <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <p className="text-sm text-white/75">
-                        Match vs <span className="font-semibold text-white">{selectedTeamTag || "Tag"}</span>
+                        Match vs <span className="font-semibold text-white">{selectedTeamTag ? formatMetricTagLabel(selectedTeamTag) : "Tag"}</span>
                       </p>
                       <p className="text-xs text-white/50">X: Match • Y: Selected Tag Value</p>
                       {compareTeam && compareTeam !== activeTeam ? (
@@ -1062,7 +2504,20 @@ function App() {
                   {selectedTeamTag && animatedChartData.length > 0 ? (
                     <div className={isTeamGraphFullscreen ? "h-[calc(100dvh-280px)] min-h-[260px] w-full" : "h-[420px] w-full"}>
                       <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={animatedChartData} margin={{ top: 12, right: 20, left: 0, bottom: 8 }}>
+                        <LineChart
+                          data={animatedChartData}
+                          margin={{ top: 12, right: 20, left: 0, bottom: 8 }}
+                          onClick={(chartState) => {
+                            const payload = (chartState as { activePayload?: Array<{ payload?: TeamChartPoint }> } | undefined)?.activePayload?.[0]?.payload;
+                            if (!payload) {
+                              return;
+                            }
+
+                            if (route.kind === "team") {
+                              navigateMatch(route.projectId, route.team, payload.match);
+                            }
+                          }}
+                        >
                           <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
                           <XAxis
                             dataKey="match"
@@ -1087,7 +2542,8 @@ function App() {
                             formatter={(value, name, item) => {
                               const numeric = typeof value === "number" ? value : Number(value);
                               const entry = item.payload as TeamChartPoint;
-                              const tagLabel = name === "compareValue" ? `${selectedTeamTag} (Compare)` : selectedTeamTag;
+                              const baseLabel = selectedTeamTag ? formatMetricTagLabel(selectedTeamTag) : "Tag";
+                              const tagLabel = name === "compareValue" ? `${baseLabel} (Compare)` : baseLabel;
                               const scouter = name === "compareValue" ? entry.compareScouter || "Unknown" : entry.scouter || "Unknown";
                               const valueLabel = Number.isFinite(numeric) ? numeric.toFixed(2) : String(value);
                               return [`${valueLabel} • Scouter: ${scouter}`, tagLabel];
@@ -1130,9 +2586,255 @@ function App() {
                   )}
                 </div>
               </div>
+
+              <div className="space-y-3 rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+                  <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                    <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Accuracy Metrics</p>
+                    <div className="max-h-40 space-y-2 overflow-y-auto pr-1 text-xs">
+                      {selectedTeamAccuracyStats.length === 0 ? (
+                        <p className="text-white/50">No success/fail metrics found.</p>
+                      ) : (
+                        selectedTeamAccuracyStats.map((item) => (
+                          <div key={`acc-team-route-${item.tag}`}>
+                            <p className="text-white/75">{formatMetricTagLabel(item.tag)}</p>
+                            <div className="mt-1 h-2 w-full overflow-hidden rounded bg-white/10">
+                              <div className="h-full bg-emerald-400" style={{ width: `${Math.max(0, Math.min(100, item.accuracy * 100))}%` }} />
+                            </div>
+                            <p className="mt-1 text-white/55">{(item.accuracy * 100).toFixed(1)}% • S {item.successes} / F {item.fails}</p>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                    <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Toggle Frequency</p>
+                    <div className="space-y-2 text-xs">
+                      {selectedTeamToggleStats.map((item) => (
+                        <div key={`toggle-team-route-${item.tag}`}>
+                          <p className="text-white/75">{item.tag}</p>
+                          <div className="mt-1 h-2 w-full overflow-hidden rounded bg-white/10">
+                            <div className="h-full bg-amber-400" style={{ width: `${Math.max(0, Math.min(100, item.rate * 100))}%` }} />
+                          </div>
+                          <p className="mt-1 text-white/55">{(item.rate * 100).toFixed(1)}% true ({item.trueCount}/{item.total})</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                    <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Held Time Per Match</p>
+                    <div className="space-y-2 text-xs">
+                      {selectedTeamHeldStats.length === 0 ? (
+                        <p className="text-white/50">No hold-time metrics found.</p>
+                      ) : (
+                        selectedTeamHeldStats.map((item) => (
+                          <div key={`held-team-route-${item.tag}`} className="flex items-center justify-between text-white/75">
+                            <span>{formatMetricTagLabel(item.tag)}</span>
+                            <span>{item.average.toFixed(2)}s</span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {selectedTeamHasEventTracking ? (
+                  <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                    <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Cycle Time Builder (event-tracking only)</p>
+                    <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+                      <Input value={cycleMetricName} onChange={(event) => setCycleMetricName(event.currentTarget.value)} placeholder="Metric name" className="h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+                      <Input value={cycleStartTag} onChange={(event) => setCycleStartTag(event.currentTarget.value)} placeholder="Start metric" className="h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+                      <Input value={cycleEndTag} onChange={(event) => setCycleEndTag(event.currentTarget.value)} placeholder="End metric" className="h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+                      <Button
+                        type="button"
+                        className="bg-blue-600 text-white hover:bg-blue-500"
+                        onClick={() => {
+                          const name = cycleMetricName.trim();
+                          const start = cycleStartTag.trim();
+                          const end = cycleEndTag.trim();
+                          if (!name || !start || !end) {
+                            return;
+                          }
+                          setSavedCycleMetrics((previous) => [
+                            ...previous,
+                            {
+                              id: `cycle-${Date.now()}-${previous.length}`,
+                              name,
+                              startTag: start,
+                              endTag: end,
+                            },
+                          ]);
+                          setCycleMetricName("");
+                          setCycleStartTag("");
+                          setCycleEndTag("");
+                        }}
+                      >
+                        Save Cycle Metric
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                  <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Matches</p>
+                  <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
+                    {selectedTeamEntries.map((entry, index) => {
+                      const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : index + 1;
+                      const scouterValue = typeof entry.scouter === "string" ? entry.scouter : "Unknown";
+                      return (
+                        <Button
+                          key={`match-card-team-route-${activeTeam}-${matchValue}-${index}`}
+                          type="button"
+                          variant="outline"
+                          className="w-full justify-between border-white/20 bg-slate-900/60 text-white hover:bg-slate-800"
+                          onClick={() => navigateMatch(selectedProject.id, activeTeam, Number(matchValue))}
+                        >
+                          <span>Match {Number(matchValue)}</span>
+                          <span className="text-xs text-white/60">{scouterValue}</span>
+                        </Button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                  <p className="mb-2 text-xs uppercase tracking-wide text-white/55">All Qualitative Text</p>
+                  <Input value={teamNoteSearch} onChange={(event) => setTeamNoteSearch(event.currentTarget.value)} placeholder="Search notes..." className="mb-2 h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+                  <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+                    {filteredSelectedTeamNotes.map((note, index) => (
+                      <button
+                        key={`note-team-route-${note.match}-${index}`}
+                        type="button"
+                        onClick={() => navigateMatch(selectedProject.id, activeTeam, note.match)}
+                        className="w-full rounded border border-white/10 bg-slate-900/50 p-2 text-left text-xs text-white/75 transition hover:border-blue-400/50 hover:bg-blue-600/10"
+                      >
+                        <p className="font-semibold text-white">Match {note.match} • {note.scoutType} • {note.scouter}</p>
+                        <p className="mt-1">Good: {highlightSearchTerm(note.good || "—", teamNoteSearch)}</p>
+                        <p>Bad: {highlightSearchTerm(note.bad || "—", teamNoteSearch)}</p>
+                        <p>Area: {highlightSearchTerm(note.area || "—", teamNoteSearch)}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
               </div>
             </div>
           )}
+        </main>
+      </div>
+    );
+  }
+
+  if (route.kind === "match") {
+    const notesSearch = (search || "").trim().toLowerCase();
+    const goodText = typeof selectedMatchEntry?.good === "string" ? selectedMatchEntry.good : "";
+    const badText = typeof selectedMatchEntry?.bad === "string" ? selectedMatchEntry.bad : "";
+    const areaText = typeof selectedMatchEntry?.area === "string" ? selectedMatchEntry.area : "";
+    const noteBlocks = [goodText, badText, areaText].filter((value) => value.trim().length > 0);
+    const noteMatchCount = notesSearch
+      ? noteBlocks.filter((value) => value.toLowerCase().includes(notesSearch)).length
+      : noteBlocks.length;
+
+    const startPosition = Array.isArray(selectedMatchEntry?.p) ? selectedMatchEntry.p : null;
+    const normalizedStartX = startPosition && typeof startPosition[0] === "number" ? Math.min(Math.max(startPosition[0], 0), 1) : null;
+    const normalizedStartY = startPosition && typeof startPosition[1] === "number" ? Math.min(Math.max(startPosition[1], 0), 1) : null;
+    const layoutPayload = parseLayoutPayload(projectConfig.layoutPayload);
+
+    return (
+      <div className="min-h-screen bg-slate-900 text-white">
+        <header className="flex items-center justify-between border-b border-white/10 bg-slate-900 px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="text-4xl font-black tracking-tight text-white">GoonHQ</div>
+            <Button type="button" variant="secondary" size="sm" onClick={navigateHome}>
+              <Home className="mr-2 h-4 w-4" />
+              Home
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={() => navigateTeam(route.projectId, route.team)}>
+              <Folder className="mr-2 h-4 w-4" />
+              Team {route.team}
+            </Button>
+          </div>
+          <div className="text-sm text-white/65">Match {route.match}</div>
+        </header>
+
+        <main className="space-y-4 p-4 md:p-6">
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+            <section className="space-y-4 rounded-2xl border border-white/10 bg-slate-950/60 p-4 xl:col-span-7">
+              <h1 className="text-2xl font-semibold tracking-tight">Team {route.team} • Match {route.match}</h1>
+              <p className="text-sm text-white/70">Scouter: {typeof selectedMatchEntry?.scouter === "string" && selectedMatchEntry.scouter.trim() ? selectedMatchEntry.scouter : "Unknown"}</p>
+
+              <div className="relative h-[340px] overflow-hidden rounded-xl border border-white/10 bg-slate-900/60">
+                {projectConfig.backgroundImage && layoutPayload ? (
+                  <MiniScoutField payloadObject={layoutPayload} fieldImageUrl={projectConfig.backgroundImage} className="h-full w-full" />
+                ) : projectConfig.backgroundImage ? (
+                  <img src={projectConfig.backgroundImage} alt="Field" className="h-full w-full object-contain" />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-sm text-white/50">No background image available in project config.</div>
+                )}
+
+                {normalizedStartX !== null && normalizedStartY !== null ? (
+                  <div
+                    className="absolute h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-blue-500"
+                    style={{ left: `${normalizedStartX * 100}%`, top: `${normalizedStartY * 100}%` }}
+                    title="Robot start position"
+                  />
+                ) : null}
+              </div>
+
+              <div>
+                <p className="mb-2 text-sm font-semibold text-white">Scout Button Timeline</p>
+                {selectedMatchTimelineEvents.length === 0 ? (
+                  <div className="rounded-lg border border-white/10 bg-slate-900/50 px-3 py-2 text-xs text-white/60">No event-time-tracking timeline available for this match record.</div>
+                ) : (
+                  <div className="max-h-[220px] space-y-2 overflow-y-auto pr-1">
+                    {selectedMatchTimelineEvents.map((event, index) => (
+                      <div key={`${event.phase}-${event.metric}-${event.time}-${index}`} className="rounded-lg border border-white/10 bg-slate-900/50 px-3 py-2 text-xs text-white/80">
+                        <span className="font-semibold text-white">{event.time.toFixed(2)}s</span> • {event.metric} ({event.phase}) • {event.valueLabel}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+
+            <section className="space-y-4 rounded-2xl border border-white/10 bg-slate-950/60 p-4 xl:col-span-5">
+              <h2 className="text-lg font-semibold text-white">Notes + Qualitative</h2>
+              <Input value={search} onChange={(event) => setSearch(event.currentTarget.value)} placeholder="Find note keywords..." className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+              <p className="text-xs text-white/60">Matching note blocks: {noteMatchCount}</p>
+
+              <div className="space-y-2">
+                <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
+                  <p className="text-xs uppercase text-white/55">Good</p>
+                  <p className="mt-1 text-sm text-white/80">{goodText || "—"}</p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
+                  <p className="text-xs uppercase text-white/55">Bad</p>
+                  <p className="mt-1 text-sm text-white/80">{badText || "—"}</p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
+                  <p className="text-xs uppercase text-white/55">Area</p>
+                  <p className="mt-1 text-sm text-white/80">{areaText || "—"}</p>
+                </div>
+              </div>
+
+              <div>
+                <p className="mb-2 text-sm font-semibold text-white">Other Robots In This Match</p>
+                {otherMatchTeams.length === 0 ? (
+                  <div className="rounded-lg border border-white/10 bg-slate-900/50 px-3 py-2 text-xs text-white/60">No additional teams found in loaded records for this match.</div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2">
+                    {otherMatchTeams.map((team) => (
+                      <Button key={team} type="button" variant="outline" className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800" onClick={() => navigateTeam(route.projectId, team)}>
+                        Team {team}
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>
         </main>
       </div>
     );
@@ -1234,12 +2936,71 @@ function App() {
                   <p className="text-sm text-white/80">Folder: {selectedProject.folder_path}</p>
                   <p className="mt-2 text-sm text-white/80">Scanner JSON: {selectedProject.json_file_path ?? "No JSON file yet"}</p>
                 </div>
-                <JsonViewerPage initialPath={selectedProject.json_file_path ?? ""} projectId={selectedProject.id} embedded />
+                <JsonViewerPage initialPath={selectedProject.json_file_path ?? ""} projectId={selectedProject.id} fieldMapping={decodeFieldMapping} embedded />
               </div>
             ) : projectSection === "config" ? (
               <div className="space-y-4">
                 <h1 className="text-3xl font-semibold tracking-tight">Config</h1>
-                <p className="text-white/70">Project configuration tools will live here.</p>
+                <p className="text-white/70">Configure content hashes for match, qualitative, and pit scouting payloads.</p>
+
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                    <p className="mb-2 text-sm font-semibold text-white">Match Content Hash</p>
+                    <Input
+                      value={projectConfig.matchContentHash}
+                      onChange={(event) => setProjectConfig((previous) => ({ ...previous, matchContentHash: event.currentTarget.value }))}
+                      placeholder="Enter match hash"
+                      className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                    />
+                    <Button
+                      type="button"
+                      className="mt-3 w-full bg-blue-600 text-white hover:bg-blue-500"
+                      onClick={() => void validateAndSaveConfigHash("match")}
+                      disabled={isSavingConfig}
+                    >
+                      {isSavingConfig ? "Saving..." : "Validate + Save Match"}
+                    </Button>
+                  </div>
+
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                    <p className="mb-2 text-sm font-semibold text-white">Qualitative Content Hash</p>
+                    <Input
+                      value={projectConfig.qualitativeContentHash}
+                      onChange={(event) => setProjectConfig((previous) => ({ ...previous, qualitativeContentHash: event.currentTarget.value }))}
+                      placeholder="Enter qualitative hash"
+                      className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                    />
+                    <Button
+                      type="button"
+                      className="mt-3 w-full bg-blue-600 text-white hover:bg-blue-500"
+                      onClick={() => void validateAndSaveConfigHash("qualitative")}
+                      disabled={isSavingConfig}
+                    >
+                      {isSavingConfig ? "Saving..." : "Validate + Save Qualitative"}
+                    </Button>
+                  </div>
+
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                    <p className="mb-2 text-sm font-semibold text-white">Pit Content Hash</p>
+                    <Input
+                      value={projectConfig.pitContentHash}
+                      onChange={(event) => setProjectConfig((previous) => ({ ...previous, pitContentHash: event.currentTarget.value }))}
+                      placeholder="Enter pit hash"
+                      className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                    />
+                    <Button
+                      type="button"
+                      className="mt-3 w-full bg-blue-600 text-white hover:bg-blue-500"
+                      onClick={() => void validateAndSaveConfigHash("pit")}
+                      disabled={isSavingConfig}
+                    >
+                      {isSavingConfig ? "Saving..." : "Validate + Save Pit"}
+                    </Button>
+                  </div>
+                </div>
+
+                {configStatus ? <p className="text-sm text-white/80">{configStatus}</p> : null}
+                {projectConfig.backgroundImage ? <p className="text-xs text-white/55">Resolved background image: {projectConfig.backgroundImage}</p> : null}
               </div>
             ) : projectSection === "compare" ? (
               <div className="space-y-4">
@@ -1253,7 +3014,103 @@ function App() {
             ) : projectSection === "picklist" ? (
               <div className="space-y-4">
                 <h1 className="text-3xl font-semibold tracking-tight">Picklist</h1>
-                <p className="text-white/70">Picklist tools and exports will live here.</p>
+                <p className="text-white/70">Adjust metric weights, rank teams, drag reorder, and right-click to strike selected teams.</p>
+
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+                  <section className="space-y-3 rounded-xl border border-white/10 bg-slate-900/50 p-4 xl:col-span-4">
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={activePicklist?.id ?? ""}
+                        onChange={(event) => setActivePicklistId(event.currentTarget.value)}
+                        className="h-10 flex-1 rounded-md border border-white/15 bg-slate-900 px-2 text-sm text-white"
+                      >
+                        {picklists.map((picklist) => (
+                          <option key={picklist.id} value={picklist.id}>{picklist.name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <Input
+                        value={newPicklistName}
+                        onChange={(event) => setNewPicklistName(event.currentTarget.value)}
+                        placeholder="New picklist name"
+                        className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                      />
+                      <Button type="button" className="bg-blue-600 text-white hover:bg-blue-500" onClick={createNewPicklist}>Create</Button>
+                    </div>
+
+                    <div className="relative">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
+                      <Input
+                        value={picklistMetricSearch}
+                        onChange={(event) => setPicklistMetricSearch(event.currentTarget.value)}
+                        placeholder="Search metric sliders..."
+                        className="h-10 border-white/10 bg-slate-900/80 pl-9 text-white placeholder:text-white/35"
+                      />
+                    </div>
+
+                    <div className="max-h-[520px] space-y-3 overflow-y-auto pr-1">
+                      {picklistFilteredTags.map((tag) => {
+                        const currentWeight = activePicklist?.metricWeights[tag] ?? 0;
+                        return (
+                          <div key={`weight-${tag}`} className="rounded-lg border border-white/10 bg-slate-950/60 p-3">
+                            <p className="mb-2 text-xs text-white/60">{formatMetricTagLabel(tag)}</p>
+                            <input
+                              type="range"
+                              min={-3}
+                              max={3}
+                              step={0.1}
+                              value={currentWeight}
+                              onChange={(event) => setPicklistMetricWeight(tag, Number(event.currentTarget.value))}
+                              className="w-full"
+                            />
+                            <p className="mt-1 text-xs text-white/70">Weight: {currentWeight.toFixed(1)}</p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="space-y-3 rounded-xl border border-white/10 bg-slate-900/50 p-4 xl:col-span-8">
+                    <p className="text-sm text-white/70">Ranked Teams (best to worst by weighted score)</p>
+                    <div className="max-h-[620px] space-y-2 overflow-y-auto pr-1">
+                      {picklistRows.map((row, index) => {
+                        const isStruck = activePicklist?.struckTeams.includes(row.team) ?? false;
+                        return (
+                          <button
+                            key={`pick-row-${row.team}`}
+                            type="button"
+                            draggable
+                            onDragStart={() => setDraggingPickTeam(row.team)}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDrop={() => {
+                              if (draggingPickTeam) {
+                                movePicklistTeam(draggingPickTeam, row.team);
+                              }
+                              setDraggingPickTeam(null);
+                            }}
+                            onContextMenu={(event) => {
+                              event.preventDefault();
+                              togglePicklistStrike(row.team);
+                            }}
+                            onClick={() => selectedProject && navigateTeam(selectedProject.id, row.team)}
+                            className={`w-full rounded-lg border px-3 py-2 text-left transition ${
+                              isStruck
+                                ? "border-white/10 bg-slate-900/40 text-white/45 line-through"
+                                : "border-white/15 bg-slate-900/70 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-semibold">#{index + 1} • Team {row.team}</span>
+                              <span className="text-xs text-white/70">{row.score.toFixed(2)}</span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                </div>
               </div>
             ) : projectSection === "scouts" ? (
               <div className="space-y-4">
@@ -1328,58 +3185,234 @@ function App() {
                         <p className="mb-3 text-xs text-white/50">
                           {dataGraphType === "bar"
                             ? "Bar mode: select Y then optional Y2. Y2 must be matching auto/teleop pair."
-                            : "Select axis (X/Y), then click a tag."}
+                            : "Select top axis card (X/Y), then choose a metric below."}
                         </p>
 
-                        <div className="space-y-2">
-                          {allNumericTags.map((tag) => {
-                            const isX = dataGraphType === "scatter" && selectedDataXTag === tag;
-                            const isY = selectedDataYTag === tag;
-                            const isY2 = dataGraphType === "bar" && selectedDataYTagSecondary === tag;
-                            return (
-                              <button
-                                key={tag}
+                        <div className="max-h-[calc(100dvh-360px)] space-y-3 overflow-y-auto pr-1">
+                          <div className="rounded-lg border border-white/15 bg-slate-900/70 p-2">
+                            <p className="mb-2 text-xs uppercase text-white/55">Select Axis ({dataTagActiveAxis.toUpperCase()})</p>
+                            <div className="space-y-1.5">
+                              {dataTagGroups.map((group) => {
+                                const isExpandedBase = expandedDataMetricBase === group.base;
+                                const isSelectedBase = selectedDataBaseForActiveAxis === group.base;
+                                const axisBaseClass = dataTagActiveAxis === "x"
+                                  ? "border-blue-400/70 bg-blue-600/20"
+                                  : dataTagActiveAxis === "y"
+                                    ? "border-amber-400/70 bg-amber-600/20"
+                                    : "border-emerald-400/70 bg-emerald-600/20";
+
+                                return (
+                                  <div key={`data-group-${group.base}`} className="rounded-md border border-white/10 bg-slate-950/60 p-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const defaultVariant = group.variants[0]?.key ?? "value";
+                                        setExpandedDataMetricBase((previous) => (previous === group.base ? "" : group.base));
+                                        setExpandedDataMetricVariant(defaultVariant);
+
+                                        if (dataTagActiveAxis === "x") {
+                                          setSelectedDataXBaseMetric(group.base);
+                                          setSelectedDataXVariant(defaultVariant);
+                                        } else if (dataTagActiveAxis === "y2") {
+                                          setSelectedDataY2BaseMetric(group.base);
+                                          setSelectedDataY2Variant(defaultVariant);
+                                        } else {
+                                          setSelectedDataYBaseMetric(group.base);
+                                          setSelectedDataYVariant(defaultVariant);
+                                        }
+                                      }}
+                                      className={`w-full rounded-md border px-2 py-1.5 text-left text-xs font-medium transition ${
+                                        isSelectedBase
+                                          ? `${axisBaseClass} text-white`
+                                          : "border-white/15 bg-slate-900 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
+                                      }`}
+                                    >
+                                      {group.base}
+                                    </button>
+
+                                    {isExpandedBase ? (
+                                      <div className="mt-1.5 space-y-1.5">
+                                        {group.variants.map((variant) => {
+                                          const isExpandedVariant = expandedDataMetricVariant === variant.key;
+                                          const isSelectedVariant = isSelectedBase && selectedDataVariantForActiveAxis === variant.key;
+                                          const variantClass = dataTagActiveAxis === "x"
+                                            ? "border-blue-300/70 bg-blue-500/20"
+                                            : dataTagActiveAxis === "y"
+                                              ? "border-amber-300/70 bg-amber-500/20"
+                                              : "border-emerald-300/70 bg-emerald-500/20";
+
+                                          return (
+                                            <div key={`data-variant-${group.base}-${variant.key}`} className="rounded-md border border-white/10 bg-slate-900/60 p-1.5">
+                                              <button
+                                                type="button"
+                                                onClick={() => {
+                                                  setExpandedDataMetricVariant((previous) => (previous === variant.key ? null : variant.key));
+
+                                                  if (dataTagActiveAxis === "x") {
+                                                    setSelectedDataXBaseMetric(group.base);
+                                                    setSelectedDataXVariant(variant.key);
+                                                  } else if (dataTagActiveAxis === "y2") {
+                                                    setSelectedDataY2BaseMetric(group.base);
+                                                    setSelectedDataY2Variant(variant.key);
+                                                  } else {
+                                                    setSelectedDataYBaseMetric(group.base);
+                                                    setSelectedDataYVariant(variant.key);
+                                                  }
+                                                }}
+                                                className={`w-full rounded-md border px-2 py-1 text-left text-[11px] font-medium transition ${
+                                                  isSelectedVariant
+                                                    ? `${variantClass} text-white`
+                                                    : "border-white/15 bg-slate-950/70 text-white/85 hover:border-blue-400/60 hover:bg-blue-600/20"
+                                                }`}
+                                              >
+                                                {variant.label}
+                                              </button>
+
+                                              {isExpandedVariant ? (
+                                                <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+                                                  {(["auto", "teleop"] as const).map((phase) => {
+                                                    const enabled = Boolean(variant.tagsByPhase[phase]);
+                                                    const selected = isSelectedVariant && selectedDataPhaseForActiveAxis === phase;
+                                                    const phaseClass = dataTagActiveAxis === "x"
+                                                      ? "border-blue-400/70 bg-blue-600/20"
+                                                      : dataTagActiveAxis === "y"
+                                                        ? "border-amber-400/70 bg-amber-600/20"
+                                                        : "border-emerald-400/70 bg-emerald-600/20";
+                                                    return (
+                                                      <button
+                                                        key={`data-phase-${group.base}-${variant.key}-${phase}`}
+                                                        type="button"
+                                                        disabled={!enabled}
+                                                        onClick={() => {
+                                                          if (!enabled) {
+                                                            return;
+                                                          }
+
+                                                          if (dataTagActiveAxis === "x") {
+                                                            setSelectedDataXBaseMetric(group.base);
+                                                            setSelectedDataXVariant(variant.key);
+                                                            setSelectedDataXPhase(phase);
+                                                          } else if (dataTagActiveAxis === "y2") {
+                                                            setSelectedDataY2BaseMetric(group.base);
+                                                            setSelectedDataY2Variant(variant.key);
+                                                            setSelectedDataY2Phase(phase);
+                                                          } else {
+                                                            setSelectedDataYBaseMetric(group.base);
+                                                            setSelectedDataYVariant(variant.key);
+                                                            setSelectedDataYPhase(phase);
+                                                          }
+                                                        }}
+                                                        className={`rounded-md border px-2 py-1 text-xs transition ${
+                                                          !enabled
+                                                            ? "border-white/10 bg-slate-900/40 text-white/25"
+                                                            : selected
+                                                              ? `${phaseClass} text-white`
+                                                              : "border-white/15 bg-slate-900/80 text-white/85 hover:border-blue-400/60 hover:bg-blue-600/20"
+                                                        }`}
+                                                      >
+                                                        {phase}
+                                                      </button>
+                                                    );
+                                                  })}
+                                                </div>
+                                              ) : null}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {dataGraphType === "weighted" ? (
+                            <div className="space-y-2 rounded-lg border border-white/15 bg-slate-900/70 p-2">
+                              <p className="text-xs uppercase text-white/55">Weighted Metrics</p>
+                              {weightedMetricSelections.map((selection) => (
+                                <div key={selection.id} className="rounded-md border border-white/10 bg-slate-950/70 p-2">
+                                  <select
+                                    value={selection.baseMetric}
+                                    onChange={(event) => {
+                                      const nextValue = event.currentTarget.value;
+                                      setWeightedMetricSelections((previous) =>
+                                        previous.map((item) => (item.id === selection.id ? { ...item, baseMetric: nextValue } : item)),
+                                      );
+                                    }}
+                                    className="mb-1 h-8 w-full rounded-md border border-white/15 bg-slate-900 px-2 text-xs text-white"
+                                  >
+                                    {basePhaseMetrics.map((item) => (
+                                      <option key={`w-base-${selection.id}-${item.base}`} value={item.base}>{item.base}</option>
+                                    ))}
+                                  </select>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <select
+                                      value={selection.phase}
+                                      onChange={(event) => {
+                                        const nextPhase = event.currentTarget.value as "auto" | "teleop";
+                                        setWeightedMetricSelections((previous) =>
+                                          previous.map((item) => (item.id === selection.id ? { ...item, phase: nextPhase } : item)),
+                                        );
+                                      }}
+                                      className="h-8 rounded-md border border-white/15 bg-slate-900 px-2 text-xs text-white"
+                                    >
+                                      <option value="auto">auto</option>
+                                      <option value="teleop">teleop</option>
+                                    </select>
+                                    <Input
+                                      value={String(selection.weight)}
+                                      onChange={(event) => {
+                                        const parsed = Number(event.currentTarget.value);
+                                        setWeightedMetricSelections((previous) =>
+                                          previous.map((item) =>
+                                            item.id === selection.id
+                                              ? { ...item, weight: Number.isFinite(parsed) ? parsed : 0 }
+                                              : item,
+                                          ),
+                                        );
+                                      }}
+                                      className="h-8 border-white/10 bg-slate-900/80 text-xs text-white"
+                                      placeholder="weight"
+                                    />
+                                  </div>
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="mt-2 h-7 w-full border-white/20 bg-slate-900/60 text-xs text-white hover:bg-slate-800"
+                                    onClick={() => {
+                                      setWeightedMetricSelections((previous) => previous.filter((item) => item.id !== selection.id));
+                                    }}
+                                    disabled={weightedMetricSelections.length <= 1}
+                                  >
+                                    Remove
+                                  </Button>
+                                </div>
+                              ))}
+                              <Button
                                 type="button"
+                                variant="outline"
+                                className="h-8 w-full border-white/20 bg-slate-900/60 text-xs text-white hover:bg-slate-800"
                                 onClick={() => {
-                                  const axis = dataGraphType === "bar" ? (activeDataAxis === "y2" ? "y2" : "y") : (activeDataAxis ?? "x");
-                                  if (axis === "x") {
-                                    setSelectedDataXTag(tag);
-                                    setDataTagSelectionError("");
-                                  } else if (axis === "y") {
-                                    setSelectedDataYTag(tag);
-                                    if (selectedDataYTagSecondary && !isAutoTeleopPair(tag, selectedDataYTagSecondary)) {
-                                      setSelectedDataYTagSecondary("");
-                                    }
-                                    setDataTagSelectionError("");
-                                  } else {
-                                    if (!selectedDataYTag) {
-                                      setDataTagSelectionError("Select Y axis tag first before Y2.");
-                                      return;
-                                    }
-                                    if (isAutoTeleopPair(selectedDataYTag, tag)) {
-                                      setSelectedDataYTagSecondary(tag);
-                                      setDataTagSelectionError("");
-                                    } else {
-                                      setDataTagSelectionError("Y2 must be the same metric with opposite auto/teleop prefix.");
-                                    }
+                                  const firstBase = basePhaseMetrics[0]?.base ?? "";
+                                  if (!firstBase) {
+                                    return;
                                   }
+                                  setWeightedMetricSelections((previous) => [
+                                    ...previous,
+                                    {
+                                      id: `metric-${Date.now()}-${previous.length}`,
+                                      baseMetric: firstBase,
+                                      phase: "auto",
+                                      weight: 1,
+                                    },
+                                  ]);
                                 }}
-                                className={`w-full rounded-lg border px-3 py-2 text-left text-sm font-medium transition ${
-                                  isX && isY
-                                    ? "border-violet-400/70 bg-violet-600/20 text-white"
-                                    : isX
-                                      ? "border-blue-400/70 bg-blue-600/20 text-white"
-                                      : isY2
-                                        ? "border-emerald-400/70 bg-emerald-600/20 text-white"
-                                      : isY
-                                        ? "border-amber-400/70 bg-amber-600/20 text-white"
-                                        : "border-white/15 bg-slate-900/70 text-white hover:border-blue-400/60 hover:bg-blue-600/20"
-                                }`}
                               >
-                                {tag}
-                              </button>
-                            );
-                          })}
+                                Add Metric
+                              </Button>
+                            </div>
+                          ) : null}
                         </div>
                       </aside>
 
@@ -1396,7 +3429,7 @@ function App() {
                               }`}
                             >
                               <p className="text-xs text-white/55">X Axis</p>
-                              <p className="mt-1 text-sm font-semibold text-white">{selectedDataXTag || "Click then select tag"}</p>
+                              <p className="mt-1 text-sm font-semibold text-white">{selectedDataXTag ? formatMetricTagLabel(selectedDataXTag) : "Click then select tag"}</p>
                             </button>
                           ) : null}
 
@@ -1410,7 +3443,7 @@ function App() {
                             }`}
                           >
                             <p className="text-xs text-white/55">Y Axis</p>
-                            <p className="mt-1 text-sm font-semibold text-white">{selectedDataYTag || "Click then select tag"}</p>
+                            <p className="mt-1 text-sm font-semibold text-white">{selectedDataYTag ? formatMetricTagLabel(selectedDataYTag) : "Click then select tag"}</p>
                           </button>
 
                           {dataGraphType === "bar" ? (
@@ -1424,7 +3457,7 @@ function App() {
                               }`}
                             >
                               <p className="text-xs text-white/55">Y2 Axis (optional)</p>
-                              <p className="mt-1 text-sm font-semibold text-white">{selectedDataYTagSecondary || "Click then select auto/teleop pair"}</p>
+                              <p className="mt-1 text-sm font-semibold text-white">{selectedDataYTagSecondary ? formatMetricTagLabel(selectedDataYTagSecondary) : "Click then select phase pair"}</p>
                             </button>
                           ) : null}
 
@@ -1447,6 +3480,17 @@ function App() {
                               }}
                             >
                               Bar
+                            </Button>
+                            <Button
+                              type="button"
+                              variant={dataGraphType === "weighted" ? "default" : "outline"}
+                              className={dataGraphType === "weighted" ? "bg-blue-600 text-white hover:bg-blue-500" : "border-white/20 bg-slate-900/60 text-white hover:bg-slate-800"}
+                              onClick={() => {
+                                setDataGraphType("weighted");
+                                setDataTagSelectionError("");
+                              }}
+                            >
+                              Weighted
                             </Button>
                           </div>
                         </div>
@@ -1484,19 +3528,28 @@ function App() {
                         <div className={isDataGraphFullscreen ? "h-[calc(100dvh-280px)] min-h-[280px] w-full" : "h-[460px] w-full"}>
                           <ResponsiveContainer width="100%" height="100%">
                             {dataGraphType === "scatter" ? (
-                              <ScatterChart margin={{ top: 12, right: 20, left: 10, bottom: 14 }}>
+                              <ScatterChart
+                                margin={{ top: 12, right: 20, left: 10, bottom: 14 }}
+                                onClick={(chartState) => {
+                                  const payload = (chartState as { activePayload?: Array<{ payload?: { team?: string } }> } | undefined)?.activePayload?.[0]?.payload;
+                                  const team = typeof payload?.team === "string" ? payload.team : "";
+                                  if (team) {
+                                    openMatchFromDataTeam(team);
+                                  }
+                                }}
+                              >
                                 <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
                                 <XAxis
                                   type="number"
                                   dataKey="x"
-                                  name={selectedDataXTag || "x"}
+                                  name={selectedDataXTag ? formatMetricTagLabel(selectedDataXTag) : "x"}
                                   domain={["auto", "auto"]}
                                   tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
                                 />
                                 <YAxis
                                   type="number"
                                   dataKey="y"
-                                  name={selectedDataYTag || "y"}
+                                  name={selectedDataYTag ? formatMetricTagLabel(selectedDataYTag) : "y"}
                                   domain={["auto", "auto"]}
                                   tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
                                   width={70}
@@ -1528,8 +3581,18 @@ function App() {
                                   </Scatter>
                                 ) : null}
                               </ScatterChart>
-                            ) : (
-                              <BarChart data={dataBarRows} margin={{ top: 12, right: 20, left: 10, bottom: 70 }}>
+                            ) : dataGraphType === "bar" ? (
+                              <BarChart
+                                data={dataBarRows}
+                                margin={{ top: 12, right: 20, left: 10, bottom: 70 }}
+                                onClick={(chartState) => {
+                                  const payload = (chartState as { activePayload?: Array<{ payload?: { team?: string } }> } | undefined)?.activePayload?.[0]?.payload;
+                                  const team = typeof payload?.team === "string" ? payload.team : "";
+                                  if (team) {
+                                    openMatchFromDataTeam(team);
+                                  }
+                                }}
+                              >
                                 <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
                                 <XAxis
                                   dataKey="team"
@@ -1553,7 +3616,9 @@ function App() {
                                   }}
                                   formatter={(value, name, item) => {
                                     const numeric = typeof value === "number" ? value : Number(value);
-                                    const labelName = name === "secondaryValue" ? (selectedDataYTagSecondary || "Y2") : selectedDataYTag;
+                                    const labelName = name === "secondaryValue"
+                                      ? (selectedDataYTagSecondary ? formatMetricTagLabel(selectedDataYTagSecondary) : "Y2")
+                                      : (selectedDataYTag ? formatMetricTagLabel(selectedDataYTag) : "Y");
                                     const row = item.payload as { totalValue: number };
                                     return [
                                       `${Number.isFinite(numeric) ? numeric.toFixed(2) : String(value)} • Total ${row.totalValue.toFixed(2)}`,
@@ -1562,18 +3627,56 @@ function App() {
                                   }}
                                   labelFormatter={(label) => `Team ${label}`}
                                 />
-                                <Bar dataKey="primaryValue" stackId="score" radius={[0, 0, 0, 0]} name={selectedDataYTag || "Y"}>
+                                <Bar dataKey="primaryValue" stackId="score" radius={[0, 0, 0, 0]} name={selectedDataYTag ? formatMetricTagLabel(selectedDataYTag) : "Y"}>
                                   {dataBarRows.map((row) => (
                                     <Cell key={`primary-${row.team}`} fill={highlightedBarTeams.has(row.team) ? "#93c5fd" : "#60a5fa"} />
                                   ))}
                                 </Bar>
                                 {selectedDataYTagSecondary ? (
-                                  <Bar dataKey="secondaryValue" stackId="score" radius={[6, 6, 0, 0]} name={selectedDataYTagSecondary}>
+                                  <Bar dataKey="secondaryValue" stackId="score" radius={[6, 6, 0, 0]} name={selectedDataYTagSecondary ? formatMetricTagLabel(selectedDataYTagSecondary) : "Y2"}>
                                     {dataBarRows.map((row) => (
                                       <Cell key={`secondary-${row.team}`} fill={highlightedBarTeams.has(row.team) ? "#facc15" : "#f59e0b"} />
                                     ))}
                                   </Bar>
                                 ) : null}
+                              </BarChart>
+                            ) : (
+                              <BarChart data={weightedDataRows} margin={{ top: 12, right: 20, left: 10, bottom: 70 }}>
+                                <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
+                                <XAxis
+                                  dataKey="team"
+                                  interval={0}
+                                  angle={-35}
+                                  textAnchor="end"
+                                  height={70}
+                                  tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 11 }}
+                                />
+                                <YAxis
+                                  domain={["auto", "auto"]}
+                                  tick={{ fill: "rgba(255,255,255,0.75)", fontSize: 12 }}
+                                  width={70}
+                                />
+                                <Tooltip
+                                  contentStyle={{
+                                    backgroundColor: "rgba(2,6,23,0.95)",
+                                    border: "1px solid rgba(255,255,255,0.15)",
+                                    borderRadius: "0.75rem",
+                                    color: "white",
+                                  }}
+                                  formatter={(value, _name, item) => {
+                                    const numeric = typeof value === "number" ? value : Number(value);
+                                    const row = item.payload as { metricBreakdown: Record<string, number> };
+                                    const breakdown = Object.entries(row.metricBreakdown)
+                                      .map(([tag, weighted]) => `${formatMetricTagLabel(tag)}: ${weighted.toFixed(2)}`)
+                                      .join(" • ");
+                                    return [
+                                      `${Number.isFinite(numeric) ? numeric.toFixed(2) : String(value)}${breakdown ? ` • ${breakdown}` : ""}`,
+                                      "Weighted Score",
+                                    ];
+                                  }}
+                                  labelFormatter={(label) => `Team ${label}`}
+                                />
+                                <Bar dataKey="weightedScore" name="Weighted Score" fill="#60a5fa" radius={[6, 6, 0, 0]} />
                               </BarChart>
                             )}
                           </ResponsiveContainer>
@@ -1636,10 +3739,10 @@ function App() {
                     {teamAverages.length === 0 ? (
                       <p className="text-sm text-white/60">No numeric tags available for averages.</p>
                     ) : (
-                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                      <div className="grid max-h-[320px] grid-cols-1 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                         {teamAverages.map((item) => (
                           <div key={item.tag} className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
-                            <p className="text-xs uppercase tracking-wide text-white/55">{item.tag}</p>
+                            <p className="text-xs uppercase tracking-wide text-white/55">{formatMetricTagLabel(item.tag)}</p>
                             <p className="mt-2 text-2xl font-semibold text-white">{item.average.toFixed(2)}</p>
                           </div>
                         ))}
@@ -1659,6 +3762,12 @@ function App() {
               <DialogDescription className="text-white/65">This creates a new folder under GoonHQMain/projects.</DialogDescription>
             </DialogHeader>
             <Input value={createProjectName} onChange={(event) => setCreateProjectName(event.target.value)} className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+            <Input
+              value={createProjectContentHash}
+              onChange={(event) => setCreateProjectContentHash(event.target.value)}
+              placeholder="Match content hash"
+              className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+            />
             <DialogFooter>
               <Button type="button" variant="outline" className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800" onClick={() => setIsCreateDialogOpen(false)} disabled={isCreatingProject}>
                 Cancel
@@ -1678,6 +3787,25 @@ function App() {
       <header className="flex items-center justify-between border-b border-white/10 bg-slate-900 px-6 py-4">
         <div className="text-4xl font-black tracking-tight text-white">GoonHQ</div>
         <div className="flex items-center gap-3">
+          <Button
+            type="button"
+            variant="outline"
+            className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800"
+            onClick={() => setIsDebugDialogOpen(true)}
+          >
+            <Settings className="mr-2 h-4 w-4" />
+            Backend Debug
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800"
+            onClick={() => void handleSetRootFolder()}
+            disabled={isSettingRootFolder}
+          >
+            <Folder className="mr-2 h-4 w-4" />
+            {isSettingRootFolder ? "Setting Root..." : "Set Root Folder"}
+          </Button>
           <Button type="button" className="h-10 rounded-xl bg-blue-600 px-5 text-white hover:bg-blue-500" onClick={() => setIsCreateDialogOpen(true)}>
             <Plus className="mr-2 h-4 w-4" />
             New Project
@@ -1739,6 +3867,46 @@ function App() {
         </section>
       </main>
 
+      <Dialog open={isDebugDialogOpen} onOpenChange={setIsDebugDialogOpen}>
+        <DialogContent className="border-white/10 bg-slate-950 text-white sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Backend Debug</DialogTitle>
+            <DialogDescription className="text-white/65">Validate a content hash against Supabase and confirm backend connectivity.</DialogDescription>
+          </DialogHeader>
+          <Input
+            value={debugContentHash}
+            onChange={(event) => setDebugContentHash(event.target.value)}
+            placeholder="Content hash"
+            className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+          />
+          <select
+            value={debugScoutType}
+            onChange={(event) => setDebugScoutType(event.currentTarget.value as "match" | "qualitative" | "pit")}
+            className="h-10 w-full rounded-md border border-white/10 bg-slate-900/80 px-3 text-sm text-white"
+          >
+            <option value="match">match</option>
+            <option value="qualitative">qualitative</option>
+            <option value="pit">pit</option>
+          </select>
+          {debugMessage ? <p className="text-sm text-white/80">{debugMessage}</p> : null}
+          {debugResult ? (
+            <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3 text-xs text-white/75">
+              <p>valid: {String(debugResult.valid)}</p>
+              <p>scoutType: {debugResult.scout_type ?? "unknown"}</p>
+              <p>has fieldMapping: {String(Boolean(debugResult.field_mapping))}</p>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800" onClick={() => setIsDebugDialogOpen(false)}>
+              Close
+            </Button>
+            <Button type="button" className="bg-blue-600 text-white hover:bg-blue-500" onClick={() => void handleDebugValidateHash()} disabled={isRunningDebugValidation}>
+              {isRunningDebugValidation ? "Validating..." : "Validate"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
         <DialogContent className="border-white/10 bg-slate-950 text-white sm:max-w-md">
           <DialogHeader>
@@ -1746,6 +3914,12 @@ function App() {
             <DialogDescription className="text-white/65">This creates a new folder under GoonHQMain/projects.</DialogDescription>
           </DialogHeader>
           <Input value={createProjectName} onChange={(event) => setCreateProjectName(event.target.value)} className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+          <Input
+            value={createProjectContentHash}
+            onChange={(event) => setCreateProjectContentHash(event.target.value)}
+            placeholder="Match content hash"
+            className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+          />
           <DialogFooter>
             <Button type="button" variant="outline" className="border-white/20 bg-slate-900/60 text-white hover:bg-slate-800" onClick={() => setIsCreateDialogOpen(false)} disabled={isCreatingProject}>
               Cancel

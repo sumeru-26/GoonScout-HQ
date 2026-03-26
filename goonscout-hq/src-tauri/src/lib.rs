@@ -1,4 +1,6 @@
-use serde::Serialize;
+use reqwest::blocking::Client;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,121 @@ struct WorkspaceOverview {
     root_path: String,
     projects_path: String,
     projects: Vec<ProjectFolder>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct WorkspaceSettings {
+    root_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceSettingsResponse {
+    configured_root_path: Option<String>,
+    effective_root_path: String,
+    using_default_root: bool,
+}
+
+#[derive(Serialize)]
+struct ContentHashValidationResult {
+    valid: bool,
+    content_hash: String,
+    scout_type: Option<String>,
+    message: String,
+    field_mapping: Option<serde_json::Value>,
+    payload: Option<serde_json::Value>,
+    background_image: Option<String>,
+    background_location: Option<String>,
+}
+
+fn project_config_file_path(project_id: &str) -> Result<PathBuf, String> {
+    Ok(resolve_project_folder(project_id)?.join("project.config.json"))
+}
+
+fn default_project_config() -> serde_json::Value {
+    serde_json::json!({
+        "matchContentHash": "",
+        "qualitativeContentHash": "",
+        "pitContentHash": "",
+        "backgroundImage": null,
+        "backgroundLocation": null,
+        "fieldMapping": null,
+        "updatedAt": 0
+    })
+}
+
+fn project_data_file_path(project_id: &str, file_name: &str) -> Result<PathBuf, String> {
+    let trimmed_name = file_name.trim();
+    if trimmed_name.is_empty() {
+        return Err("File name cannot be empty.".into());
+    }
+    if trimmed_name.contains("..") || trimmed_name.contains('/') || trimmed_name.contains('\\') {
+        return Err("Invalid file name for project data file.".into());
+    }
+
+    Ok(resolve_project_folder(project_id)?.join(trimmed_name))
+}
+
+fn initialize_project_files(project_folder: &Path) -> Result<(), String> {
+    let config_path = project_folder.join("project.config.json");
+    if !config_path.exists() {
+        let config_content = serde_json::to_string_pretty(&default_project_config())
+            .map_err(|error| format!("Could not serialize default project config JSON: {}", error))?;
+        fs::write(&config_path, format!("{}\n", config_content)).map_err(|error| {
+            format!(
+                "Could not initialize project config file '{}': {}",
+                config_path.display(),
+                error
+            )
+        })?;
+    }
+
+    let metrics_path = project_folder.join("metrics.json");
+    if !metrics_path.exists() {
+        fs::write(&metrics_path, "[]\n").map_err(|error| {
+            format!(
+                "Could not initialize metrics file '{}': {}",
+                metrics_path.display(),
+                error
+            )
+        })?;
+    }
+
+    let picklists_path = project_folder.join("picklists.json");
+    if !picklists_path.exists() {
+        let default_picklists = serde_json::json!([
+            {
+                "id": "default",
+                "name": "Default Picklist",
+                "metricWeights": {},
+                "order": [],
+                "struckTeams": []
+            }
+        ]);
+
+        let picklists_content = serde_json::to_string_pretty(&default_picklists)
+            .map_err(|error| format!("Could not serialize default picklists JSON: {}", error))?;
+
+        fs::write(&picklists_path, format!("{}\n", picklists_content)).map_err(|error| {
+            format!(
+                "Could not initialize picklists file '{}': {}",
+                picklists_path.display(),
+                error
+            )
+        })?;
+    }
+
+    let data_path = project_folder.join("data.json");
+    if !data_path.exists() {
+        fs::write(&data_path, "[]\n").map_err(|error| {
+            format!(
+                "Could not initialize data file '{}': {}",
+                data_path.display(),
+                error
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 fn sanitize_folder_name(input: &str) -> String {
@@ -60,8 +177,65 @@ fn detect_home_dir() -> Result<PathBuf, String> {
     Err("Could not determine a home directory for workspace creation.".into())
 }
 
-fn resolve_workspace_root() -> Result<PathBuf, String> {
+fn default_workspace_root() -> Result<PathBuf, String> {
     Ok(detect_home_dir()?.join("GoonHQMain"))
+}
+
+fn workspace_settings_file_path() -> Result<PathBuf, String> {
+    Ok(detect_home_dir()?.join(".goonscout_hq_settings.json"))
+}
+
+fn read_workspace_settings() -> Result<WorkspaceSettings, String> {
+    let settings_path = workspace_settings_file_path()?;
+
+    if !settings_path.exists() {
+        return Ok(WorkspaceSettings::default());
+    }
+
+    let content = fs::read_to_string(&settings_path).map_err(|error| {
+        format!(
+            "Could not read workspace settings '{}': {}",
+            settings_path.display(),
+            error
+        )
+    })?;
+
+    let parsed: WorkspaceSettings = serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "Could not parse workspace settings '{}': {}",
+            settings_path.display(),
+            error
+        )
+    })?;
+
+    Ok(parsed)
+}
+
+fn write_workspace_settings(settings: &WorkspaceSettings) -> Result<(), String> {
+    let settings_path = workspace_settings_file_path()?;
+    let content = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("Could not serialize workspace settings: {}", error))?;
+
+    fs::write(&settings_path, format!("{}\n", content)).map_err(|error| {
+        format!(
+            "Could not write workspace settings '{}': {}",
+            settings_path.display(),
+            error
+        )
+    })
+}
+
+fn resolve_workspace_root() -> Result<PathBuf, String> {
+    let settings = read_workspace_settings()?;
+
+    if let Some(configured) = settings.root_path {
+        let trimmed = configured.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    default_workspace_root()
 }
 
 fn ensure_workspace_layout() -> Result<(PathBuf, PathBuf), String> {
@@ -77,6 +251,143 @@ fn ensure_workspace_layout() -> Result<(PathBuf, PathBuf), String> {
     })?;
 
     Ok((root, projects))
+}
+
+fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let (raw_key, raw_value) = trimmed.split_once('=')?;
+    let key = raw_key.trim().strip_prefix("export ").unwrap_or(raw_key.trim()).trim();
+    if key.is_empty() {
+        return None;
+    }
+
+    let mut value = raw_value.trim().to_string();
+    if (value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\'')) {
+        value = value[1..value.len() - 1].to_string();
+    }
+
+    Some((key.to_string(), value))
+}
+
+fn dotenv_candidate_paths() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join(".env.local"));
+        candidates.push(cwd.join(".env"));
+
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.join(".env.local"));
+            candidates.push(parent.join(".env"));
+
+            if let Some(grandparent) = parent.parent() {
+                candidates.push(grandparent.join(".env.local"));
+                candidates.push(grandparent.join(".env"));
+            }
+        }
+    }
+
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join(".env.local"));
+            candidates.push(exe_dir.join(".env"));
+        }
+    }
+
+    candidates
+}
+
+fn read_env_value_from_dotenv_files(key: &str) -> Option<String> {
+    for candidate in dotenv_candidate_paths() {
+        if !candidate.exists() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&candidate).ok()?;
+        for line in content.lines() {
+            let Some((line_key, line_value)) = parse_dotenv_line(line) else {
+                continue;
+            };
+
+            if line_key == key {
+                let trimmed = line_value.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn read_env_value(key: &str) -> Option<String> {
+    if let Ok(value) = env::var(key) {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+
+    read_env_value_from_dotenv_files(key)
+}
+
+fn extract_scout_type_from_payload_value(payload_value: &serde_json::Value) -> Option<String> {
+    if let Some(value) = payload_value.get("scoutType").and_then(|value| value.as_str()) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(value) = payload_value
+        .get("editorState")
+        .and_then(|editor| editor.get("scoutType"))
+        .and_then(|value| value.as_str())
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+fn extract_scout_type_from_payload(payload_value: Option<&serde_json::Value>) -> Option<String> {
+    let payload_value = payload_value?;
+
+    if let Some(found) = extract_scout_type_from_payload_value(payload_value) {
+        return Some(found);
+    }
+
+    if let Some(payload_as_text) = payload_value.as_str() {
+        if let Ok(parsed_payload) = serde_json::from_str::<serde_json::Value>(payload_as_text) {
+            return extract_scout_type_from_payload_value(&parsed_payload);
+        }
+    }
+
+    None
+}
+
+fn get_supabase_credentials() -> Result<(String, String), String> {
+    let url = read_env_value("NEXT_PUBLIC_SUPABASE_URL")
+        .ok_or_else(|| "NEXT_PUBLIC_SUPABASE_URL is not set in environment or .env.local/.env.".to_string())?;
+    let key = read_env_value("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        .ok_or_else(|| "NEXT_PUBLIC_SUPABASE_ANON_KEY is not set in environment or .env.local/.env.".to_string())?;
+
+    let trimmed_url = url.trim().trim_end_matches('/').to_string();
+    let trimmed_key = key.trim().to_string();
+
+    if trimmed_url.is_empty() || trimmed_key.is_empty() {
+        return Err("Supabase URL/key values are empty.".into());
+    }
+
+    Ok((trimmed_url, trimmed_key))
 }
 
 fn list_json_files_in_folder(folder: &Path) -> Result<Vec<PathBuf>, String> {
@@ -98,6 +409,16 @@ fn list_json_files_in_folder(folder: &Path) -> Result<Vec<PathBuf>, String> {
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or_default();
+
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if file_name == "project.config.json" || file_name == "metrics.json" || file_name == "picklists.json" {
+            continue;
+        }
 
         if extension.eq_ignore_ascii_case("json") {
             files.push(path);
@@ -198,6 +519,8 @@ fn project_from_folder(folder: &Path) -> Result<ProjectFolder, String> {
 
     let display_name = folder_name.replace('_', " ");
 
+    initialize_project_files(folder)?;
+
     let json_file_path = enforce_single_json_file(folder)?;
 
     let updated_at = fs::metadata(folder)
@@ -252,6 +575,42 @@ fn get_goonhq_workspace_overview() -> Result<WorkspaceOverview, String> {
 }
 
 #[tauri::command]
+fn get_workspace_settings() -> Result<WorkspaceSettingsResponse, String> {
+    let settings = read_workspace_settings()?;
+    let default_root = default_workspace_root()?;
+    let effective_root = resolve_workspace_root()?;
+    let configured = settings
+        .root_path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    Ok(WorkspaceSettingsResponse {
+        configured_root_path: configured,
+        effective_root_path: effective_root.to_string_lossy().to_string(),
+        using_default_root: effective_root == default_root,
+    })
+}
+
+#[tauri::command]
+fn set_workspace_root(root_path: String) -> Result<WorkspaceOverview, String> {
+    let trimmed = root_path.trim();
+    if trimmed.is_empty() {
+        return Err("Root folder cannot be empty.".into());
+    }
+
+    let root = PathBuf::from(trimmed);
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Could not create workspace root '{}': {}", root.display(), error))?;
+
+    let settings = WorkspaceSettings {
+        root_path: Some(root.to_string_lossy().to_string()),
+    };
+    write_workspace_settings(&settings)?;
+
+    get_goonhq_workspace_overview()
+}
+
+#[tauri::command]
 fn create_goonhq_project(name: String) -> Result<ProjectFolder, String> {
     let (_, projects_path) = ensure_workspace_layout()?;
     let safe_name = sanitize_folder_name(&name);
@@ -270,7 +629,190 @@ fn create_goonhq_project(name: String) -> Result<ProjectFolder, String> {
     fs::create_dir_all(&candidate)
         .map_err(|error| format!("Could not create project folder '{}': {}", candidate.display(), error))?;
 
+    initialize_project_files(&candidate)?;
+
     project_from_folder(&candidate)
+}
+
+#[tauri::command]
+fn validate_field_config_content_hash(
+    content_hash: String,
+    expected_scout_type: Option<String>,
+) -> Result<ContentHashValidationResult, String> {
+    let hash = content_hash.trim().to_string();
+    if hash.is_empty() {
+        return Ok(ContentHashValidationResult {
+            valid: false,
+            content_hash: String::new(),
+            scout_type: None,
+            message: "Content hash cannot be empty.".into(),
+            field_mapping: None,
+            payload: None,
+            background_image: None,
+            background_location: None,
+        });
+    }
+
+    let (supabase_url, supabase_key) = get_supabase_credentials()?;
+    let expected_type = expected_scout_type
+        .as_ref()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let request_url = format!(
+        "{}/rest/v1/field_configs?content_hash=eq.{}&select=content_hash,payload,field_mapping,background_image,background_location&order=updated_at.desc&limit=1",
+        supabase_url,
+        hash
+    );
+
+    let client = Client::new();
+    let response = client
+        .get(request_url)
+        .header("apikey", supabase_key.as_str())
+        .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .map_err(|error| format!("Supabase request failed: {}", error))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Supabase returned HTTP {} while validating content hash.",
+            response.status().as_u16()
+        ));
+    }
+
+    let rows: Vec<serde_json::Value> = response
+        .json()
+        .map_err(|error| format!("Could not parse Supabase response JSON: {}", error))?;
+
+    let Some(row) = rows.first() else {
+        return Ok(ContentHashValidationResult {
+            valid: false,
+            content_hash: hash,
+            scout_type: None,
+            message: "No field config found for this content hash.".into(),
+            field_mapping: None,
+            payload: None,
+            background_image: None,
+            background_location: None,
+        });
+    };
+
+    let payload = row.get("payload");
+    let scout_type = extract_scout_type_from_payload(payload);
+
+    if let Some(expected) = expected_type {
+        let current = scout_type
+            .as_ref()
+            .map(|value| value.to_lowercase())
+            .unwrap_or_default();
+        if current != expected {
+            return Ok(ContentHashValidationResult {
+                valid: false,
+                content_hash: hash,
+                scout_type,
+                message: format!(
+                    "Hash exists but scoutType mismatch. Expected '{}'.",
+                    expected
+                ),
+                field_mapping: row.get("field_mapping").cloned(),
+                payload: row.get("payload").cloned(),
+                background_image: row
+                    .get("background_image")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
+                background_location: row
+                    .get("background_location")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
+            });
+        }
+    }
+
+    Ok(ContentHashValidationResult {
+        valid: true,
+        content_hash: hash,
+        scout_type,
+        message: "Content hash is valid.".into(),
+        field_mapping: row.get("field_mapping").cloned(),
+        payload: row.get("payload").cloned(),
+        background_image: row
+            .get("background_image")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        background_location: row
+            .get("background_location")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+    })
+}
+
+#[tauri::command]
+fn fetch_tba_event_teams(event_key: String) -> Result<serde_json::Value, String> {
+    let key = read_env_value("X_TBA_AUTH_KEY")
+        .ok_or_else(|| "X_TBA_AUTH_KEY is not set in environment or .env.local/.env.".to_string())?;
+
+    let event = event_key.trim();
+    if event.is_empty() {
+        return Err("event_key cannot be empty.".into());
+    }
+
+    let url = format!(
+        "https://www.thebluealliance.com/api/v3/event/{}/teams/simple",
+        event
+    );
+
+    let client = Client::new();
+    let response = client
+        .get(url)
+        .header("X-TBA-Auth-Key", key.trim())
+        .send()
+        .map_err(|error| format!("Blue Alliance request failed: {}", error))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Blue Alliance returned HTTP {} for event teams.",
+            response.status().as_u16()
+        ));
+    }
+
+    response
+        .json()
+        .map_err(|error| format!("Could not parse Blue Alliance response JSON: {}", error))
+}
+
+#[tauri::command]
+fn fetch_tba_match(match_key: String) -> Result<serde_json::Value, String> {
+    let key = read_env_value("X_TBA_AUTH_KEY")
+        .ok_or_else(|| "X_TBA_AUTH_KEY is not set in environment or .env.local/.env.".to_string())?;
+
+    let match_value = match_key.trim();
+    if match_value.is_empty() {
+        return Err("match_key cannot be empty.".into());
+    }
+
+    let url = format!(
+        "https://www.thebluealliance.com/api/v3/match/{}/simple",
+        match_value
+    );
+
+    let client = Client::new();
+    let response = client
+        .get(url)
+        .header("X-TBA-Auth-Key", key.trim())
+        .send()
+        .map_err(|error| format!("Blue Alliance request failed: {}", error))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Blue Alliance returned HTTP {} for match lookup.",
+            response.status().as_u16()
+        ));
+    }
+
+    response
+        .json()
+        .map_err(|error| format!("Could not parse Blue Alliance response JSON: {}", error))
 }
 
 #[tauri::command]
@@ -336,6 +878,129 @@ fn ensure_project_json_for_scan(project_id: String) -> Result<String, String> {
     })?;
 
     Ok(target_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_project_config(project_id: String) -> Result<serde_json::Value, String> {
+    let config_path = project_config_file_path(project_id.trim())?;
+
+    if !config_path.exists() {
+        return Ok(default_project_config());
+    }
+
+    let content = fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "Could not read project config '{}': {}",
+            config_path.display(),
+            error
+        )
+    })?;
+
+    serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "Could not parse project config '{}': {}",
+            config_path.display(),
+            error
+        )
+    })
+}
+
+#[tauri::command]
+fn save_project_config(project_id: String, config: serde_json::Value) -> Result<(), String> {
+    let project_id_trimmed = project_id.trim();
+    if project_id_trimmed.is_empty() {
+        return Err("Project ID cannot be empty for config save.".into());
+    }
+
+    let mut config_object = config
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    config_object.insert("updatedAt".to_string(), serde_json::json!(updated_at));
+
+    let config_path = project_config_file_path(project_id_trimmed)?;
+    let normalized = serde_json::to_string_pretty(&serde_json::Value::Object(config_object))
+        .map_err(|error| format!("Could not serialize project config JSON: {}", error))?;
+
+    fs::write(&config_path, format!("{}\n", normalized)).map_err(|error| {
+        format!(
+            "Could not write project config '{}': {}",
+            config_path.display(),
+            error
+        )
+    })
+}
+
+#[tauri::command]
+fn read_or_init_project_data_file(
+    project_id: String,
+    file_name: String,
+    default_content: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let project_id_trimmed = project_id.trim();
+    if project_id_trimmed.is_empty() {
+        return Err("Project ID cannot be empty.".into());
+    }
+
+    let file_path = project_data_file_path(project_id_trimmed, file_name.trim())?;
+
+    if !file_path.exists() {
+        let normalized_default = serde_json::to_string_pretty(&default_content)
+            .map_err(|error| format!("Could not serialize default JSON content: {}", error))?;
+        fs::write(&file_path, format!("{}\n", normalized_default)).map_err(|error| {
+            format!(
+                "Could not initialize project data file '{}': {}",
+                file_path.display(),
+                error
+            )
+        })?;
+        return Ok(default_content);
+    }
+
+    let content = fs::read_to_string(&file_path).map_err(|error| {
+        format!(
+            "Could not read project data file '{}': {}",
+            file_path.display(),
+            error
+        )
+    })?;
+
+    serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "Could not parse project data file '{}': {}",
+            file_path.display(),
+            error
+        )
+    })
+}
+
+#[tauri::command]
+fn write_project_data_file(
+    project_id: String,
+    file_name: String,
+    content: serde_json::Value,
+) -> Result<(), String> {
+    let project_id_trimmed = project_id.trim();
+    if project_id_trimmed.is_empty() {
+        return Err("Project ID cannot be empty.".into());
+    }
+
+    let file_path = project_data_file_path(project_id_trimmed, file_name.trim())?;
+    let normalized_content = serde_json::to_string_pretty(&content)
+        .map_err(|error| format!("Could not serialize JSON content for save: {}", error))?;
+
+    fs::write(&file_path, format!("{}\n", normalized_content)).map_err(|error| {
+        format!(
+            "Could not write project data file '{}': {}",
+            file_path.display(),
+            error
+        )
+    })
 }
 
 #[tauri::command]
@@ -429,9 +1094,18 @@ pub fn run() {
             write_json_file,
             append_json_entry,
             get_goonhq_workspace_overview,
+            get_workspace_settings,
+            set_workspace_root,
             create_goonhq_project,
             upload_project_json,
-            ensure_project_json_for_scan
+            ensure_project_json_for_scan,
+            get_project_config,
+            save_project_config,
+            read_or_init_project_data_file,
+            write_project_data_file,
+            validate_field_config_content_hash,
+            fetch_tba_event_teams,
+            fetch_tba_match
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
