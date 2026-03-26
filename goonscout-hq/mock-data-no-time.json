@@ -1,0 +1,134 @@
+[
+  {
+    "match": 1,
+    "team": "3663",
+    "scouter": "Joey",
+    "bricked": false,
+    "slider": 58,
+    "good": "Solid teleop scoring with low misses.",
+    "bad": "Slow first cycle.",
+    "area": "Left wing",
+    "p": [0.39, 0.65],
+    "ft": [0],
+    "auto": {
+      "fuel": 18,
+      "l1": { "total": 1 },
+      "l3": { "total": 0 },
+      "passing": { "total": 8 },
+      "defenseTimeHeld": 0,
+      "outpost": {
+        "total": 1,
+        "attempts": 2,
+        "successes": 1,
+        "fails": 1,
+        "accuracy": 0.5
+      },
+      "depot": { "total": 1 },
+      "humanplayer": { "total": 0 }
+    },
+    "teleop": {
+      "fuel": 27,
+      "l1": { "total": 3 },
+      "l3": { "total": 0 },
+      "passing": { "total": 10 },
+      "defenseTimeHeld": 0,
+      "outpost": {
+        "total": 2,
+        "attempts": 3,
+        "successes": 2,
+        "fails": 1,
+        "accuracy": 0.67
+      },
+      "depot": { "total": 1 },
+      "humanplayer": { "total": 1 }
+    }
+  },
+  {
+    "match": 2,
+    "team": "3663",
+    "scouter": "Mia",
+    "bricked": false,
+    "slider": 63,
+    "good": "Fast handoff timing.",
+    "bad": "Defense time was minimal.",
+    "area": "Center",
+    "p": [0.41, 0.62],
+    "ft": [0],
+    "auto": {
+      "fuel": 20,
+      "l1": { "total": 0 },
+      "l3": { "total": 0 },
+      "passing": { "total": 9 },
+      "defenseTimeHeld": 0,
+      "outpost": {
+        "total": 1,
+        "attempts": 1,
+        "successes": 1,
+        "fails": 0,
+        "accuracy": 1
+      },
+      "depot": { "total": 2 },
+      "humanplayer": { "total": 0 }
+    },
+    "teleop": {
+      "fuel": 25,
+      "l1": { "total": 2 },
+      "l3": { "total": 0 },
+      "passing": { "total": 11 },
+      "defenseTimeHeld": 0,
+      "outpost": {
+        "total": 1,
+        "attempts": 2,
+        "successes": 1,
+        "fails": 1,
+        "accuracy": 0.5
+      },
+      "depot": { "total": 1 },
+      "humanplayer": { "total": 1 }
+    }
+  },
+  {
+    "match": 1,
+    "team": "9600",
+    "scouter": "Rina",
+    "bricked": true,
+    "slider": 40,
+    "good": "Strong defense posture.",
+    "bad": "Bricked once during teleop.",
+    "area": "Right lane",
+    "p": [0.72, 0.76],
+    "ft": [0],
+    "auto": {
+      "fuel": 10,
+      "l1": { "total": 0 },
+      "l3": { "total": 0 },
+      "passing": { "total": 5 },
+      "defenseTimeHeld": 0,
+      "outpost": {
+        "total": 0,
+        "attempts": 1,
+        "successes": 0,
+        "fails": 1,
+        "accuracy": 0
+      },
+      "depot": { "total": 1 },
+      "humanplayer": { "total": 0 }
+    },
+    "teleop": {
+      "fuel": 16,
+      "l1": { "total": 1 },
+      "l3": { "total": 0 },
+      "passing": { "total": 7 },
+      "defenseTimeHeld": 0,
+      "outpost": {
+        "total": 0,
+        "attempts": 0,
+        "successes": 0,
+        "fails": 0,
+        "accuracy": 0
+      },
+      "depot": { "total": 0 },
+      "humanplayer": { "total": 0 }
+    }
+  }
+]

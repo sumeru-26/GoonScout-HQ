@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, Fragment, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import jsQR from "jsqr";
@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { normalizeScoutingDataset, type ScoutingFieldMapping } from "@/lib/scoutingPayload";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 type JsonPath = Array<string | number>;
@@ -29,6 +30,7 @@ type JsonViewerPageProps = {
   initialPath?: string;
   embedded?: boolean;
   projectId?: string;
+  fieldMapping?: ScoutingFieldMapping | null;
 };
 
 //test
@@ -166,7 +168,7 @@ function parseDraftValue(previousValue: JsonValue, draft: string): JsonValue {
   return JSON.parse(draft) as JsonValue;
 }
 
-function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonViewerPageProps) {
+function JsonViewerPage({ initialPath = "", embedded = false, projectId, fieldMapping }: JsonViewerPageProps) {
   const [path, setPath] = useState(initialPath);
   const [jsonContent, setJsonContent] = useState("");
   const [jsonData, setJsonData] = useState<JsonValue | null>(null);
@@ -186,6 +188,7 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonV
   const scanLockedRef = useRef(false);
   const isScanningRef = useRef(false);
   const pathRef = useRef(initialPath);
+  const qrImageInputRef = useRef<HTMLInputElement | null>(null);
 
   async function waitForVideoElement(timeoutMs = 2000): Promise<HTMLVideoElement> {
     const deadline = Date.now() + timeoutMs;
@@ -564,28 +567,47 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonV
     );
   }
 
-  async function loadJsonFromPath(nextPath: string) {
+  async function loadJsonFromPath(nextPath: string): Promise<JsonValue | null> {
     const trimmedPath = nextPath.trim();
     if (!trimmedPath) {
       setStatus("Please provide a valid JSON file path.");
-      return;
+      return null;
     }
 
     setIsLoading(true);
     setStatus("Loading JSON file...");
 
     try {
+      if (!fieldMapping || !fieldMapping.mapping || Object.keys(fieldMapping.mapping).length === 0) {
+        throw new Error("Field mapping is required. Validate the match content hash in Config first.");
+      }
+
       const formattedJson = await invoke<string>("read_json_file", { path: trimmedPath });
-      const parsed = JSON.parse(formattedJson) as JsonValue;
-      setJsonData(parsed);
-      setJsonContent(formattedJson);
+      const parsed = JSON.parse(formattedJson) as unknown;
+      const sourceObject = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+      const rawEntries = Array.isArray(parsed) ? parsed : sourceObject && Array.isArray(sourceObject.data) ? sourceObject.data : sourceObject ? [sourceObject] : [];
+      const normalizedEntries = normalizeScoutingDataset(parsed, {
+        fieldMapping,
+        compressedOnly: true,
+        requireFieldMapping: true,
+      });
+      if (rawEntries.length > 0 && normalizedEntries.length === 0) {
+        throw new Error("No entries decoded. This file is legacy/non-compressed or mismatched with the selected field mapping.");
+      }
+      const normalizedValue = normalizedEntries as JsonValue;
+      const normalizedJson = `${JSON.stringify(normalizedEntries, null, 2)}\n`;
+
+      setJsonData(normalizedValue);
+      setJsonContent(normalizedJson);
       setEditing(null);
-      setStatus("JSON loaded successfully.");
+      setStatus(`JSON loaded and normalized successfully. Entries: ${normalizedEntries.length}.`);
+      return normalizedValue;
     } catch (error) {
       setJsonData(null);
       setJsonContent("");
       setEditing(null);
       setStatus(`Unable to load JSON: ${String(error)}`);
+      return null;
     } finally {
       setIsLoading(false);
     }
@@ -613,7 +635,7 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonV
 
         setPath(projectJsonPath);
         await loadJsonFromPath(projectJsonPath);
-        setStatus("JSON uploaded and replaced successfully.");
+        setStatus("JSON uploaded, normalized, and replaced successfully.");
       } catch (error) {
         setStatus(`Unable to upload JSON: ${String(error)}`);
       } finally {
@@ -642,15 +664,132 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonV
     }
 
     try {
+      if (!fieldMapping || !fieldMapping.mapping || Object.keys(fieldMapping.mapping).length === 0) {
+        throw new Error("Field mapping is required before scanning compressed payloads.");
+      }
+
+      const parsedPayload = JSON.parse(payload) as unknown;
+      const normalizedEntries = normalizeScoutingDataset(parsedPayload, {
+        fieldMapping,
+        compressedOnly: true,
+        requireFieldMapping: true,
+      });
+      if (normalizedEntries.length === 0) {
+        throw new Error("Scanned payload did not contain a valid scouting entry.");
+      }
+
+      const payloadRoot = parsedPayload && typeof parsedPayload === "object" && !Array.isArray(parsedPayload)
+        ? (parsedPayload as Record<string, unknown>)
+        : null;
+      const rawEntries = Array.isArray(parsedPayload)
+        ? parsedPayload
+        : payloadRoot && Array.isArray(payloadRoot.data)
+          ? payloadRoot.data
+          : payloadRoot
+            ? [payloadRoot]
+            : [];
+
+      const rawEntry = rawEntries[0];
+      if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+        throw new Error("Scanned payload entry format is invalid.");
+      }
+
       await invoke("append_json_entry", {
         path: trimmedPath,
-        entryJson: payload,
+        entryJson: JSON.stringify(rawEntry),
       });
 
       await loadJsonFromPath(trimmedPath);
       setStatus("QR JSON inserted at the top successfully.");
     } catch (error) {
       setStatus(`QR scan found data but append failed: ${String(error)}`);
+    }
+  }
+
+  async function ensurePathForScanActions(): Promise<string | null> {
+    if (pathRef.current.trim()) {
+      return pathRef.current.trim();
+    }
+
+    if (!projectId) {
+      setStatus("Please set a JSON file path before scanning.");
+      return null;
+    }
+
+    try {
+      const generatedPath = await invoke<string>("ensure_project_json_for_scan", {
+        projectId,
+      });
+      setPath(generatedPath);
+      pathRef.current = generatedPath;
+      return generatedPath;
+    } catch (error) {
+      setStatus(`Unable to prepare project JSON for scanning: ${String(error)}`);
+      return null;
+    }
+  }
+
+  async function handleUploadQrImage() {
+    if (isSavingEdit || isDeletingEntry || isLoading || isScanning) {
+      return;
+    }
+
+    const preparedPath = await ensurePathForScanActions();
+    if (!preparedPath) {
+      return;
+    }
+
+    qrImageInputRef.current?.click();
+  }
+
+  async function decodeQrFromImageFile(file: File) {
+    const objectUrl = URL.createObjectURL(file);
+
+    try {
+      const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const nextImage = new Image();
+        nextImage.onload = () => resolve(nextImage);
+        nextImage.onerror = () => reject(new Error("Unable to read selected image."));
+        nextImage.src = objectUrl;
+      });
+
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) {
+        throw new Error("Unable to access image canvas context.");
+      }
+
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height);
+
+      if (!code?.data) {
+        throw new Error("No QR code found in selected image.");
+      }
+
+      await handleScannedQr(code.data);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+
+  async function handleQrImageFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+
+    if (!file) {
+      setStatus("No QR image selected.");
+      return;
+    }
+
+    try {
+      setStatus("Decoding QR image...");
+      await decodeQrFromImageFile(file);
+    } catch (error) {
+      setStatus(`Unable to decode QR image: ${String(error)}`);
     }
   }
 
@@ -706,21 +845,8 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonV
   }
 
   async function handleStartScanner() {
-    if (!path.trim() && projectId) {
-      try {
-        const generatedPath = await invoke<string>("ensure_project_json_for_scan", {
-          projectId,
-        });
-        setPath(generatedPath);
-        pathRef.current = generatedPath;
-      } catch (error) {
-        setStatus(`Unable to prepare project JSON for scanning: ${String(error)}`);
-        return;
-      }
-    }
-
-    if (!path.trim() && !projectId) {
-      setStatus("Please set a JSON file path before scanning.");
+    const preparedPath = await ensurePathForScanActions();
+    if (!preparedPath) {
       return;
     }
 
@@ -803,6 +929,14 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonV
               </Button>
               <Button
                 type="button"
+                variant="outline"
+                disabled={isLoading || isSavingEdit || isDeletingEntry || isScanning}
+                onClick={() => void handleUploadQrImage()}
+              >
+                Upload QR Image
+              </Button>
+              <Button
+                type="button"
                 variant="secondary"
                 disabled={isSavingEdit || isDeletingEntry}
                 onClick={() => {
@@ -818,6 +952,16 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId }: JsonV
             </div>
 
             <p className="text-sm text-muted-foreground">{status}</p>
+
+            <input
+              ref={qrImageInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(event) => {
+                void handleQrImageFileChange(event);
+              }}
+            />
 
             {isScannerOpen ? (
               <div className="fixed inset-0 z-50 bg-black">

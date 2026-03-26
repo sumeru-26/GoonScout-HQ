@@ -1,0 +1,158 @@
+[
+  {
+    "match": 1,
+    "team": "5937",
+    "scouter": "Avery",
+    "bricked": false,
+    "slider": 68,
+    "good": "Fast auto shots and clean cycle paths.",
+    "bad": "Missed one outpost attempt under pressure.",
+    "area": "Center lane",
+    "p": [0.71, 0.62],
+    "ft": [0],
+    "auto": {
+      "outpost": {
+        "total": 3,
+        "attempts": 4,
+        "successes": 3,
+        "fails": 1,
+        "accuracy": 0.75,
+        "events": [
+          { "time": 1.42, "value": 1, "result": "success" },
+          { "time": 2.11, "value": 1, "result": "success" },
+          { "time": 2.89, "value": 1, "result": "fail" },
+          { "time": 3.41, "value": 1, "result": "success" }
+        ]
+      },
+      "fuel": {
+        "total": 12,
+        "events": [
+          { "time": 4.90, "value": 3 },
+          { "time": 5.11, "value": 3 },
+          { "time": 5.36, "value": 3 },
+          { "time": 5.59, "value": 3 }
+        ]
+      },
+      "passing": {
+        "total": 8,
+        "events": [{ "time": 7.88, "value": 8 }]
+      },
+      "defense": {
+        "totalTimeHeld": 0.52,
+        "events": [{ "time": 8.72, "duration": 0.52 }]
+      }
+    },
+    "teleop": {
+      "l1": {
+        "total": 2,
+        "events": [
+          { "time": 15.11, "value": 1 },
+          { "time": 22.41, "value": 1 }
+        ]
+      },
+      "fuel": {
+        "total": 24,
+        "events": [
+          { "time": 16.22, "value": 4 },
+          { "time": 18.09, "value": 4 },
+          { "time": 19.87, "value": 4 },
+          { "time": 21.33, "value": 4 },
+          { "time": 23.02, "value": 4 },
+          { "time": 24.49, "value": 4 }
+        ]
+      },
+      "passing": {
+        "total": 12,
+        "events": [{ "time": 20.02, "value": 12 }]
+      },
+      "humanplayer": {
+        "total": 1,
+        "events": [{ "time": 27.18, "value": 1 }]
+      },
+      "defense": {
+        "totalTimeHeld": 0.73,
+        "events": [{ "time": 25.74, "duration": 0.73 }]
+      }
+    }
+  },
+  {
+    "match": 2,
+    "team": "5937",
+    "scouter": "Noah",
+    "bricked": false,
+    "slider": 62,
+    "good": "Strong teleop fuel consistency.",
+    "bad": "Low passing value in auto.",
+    "area": "Near source",
+    "p": [0.68, 0.58],
+    "ft": [0],
+    "auto": {
+      "fuel": {
+        "total": 9,
+        "events": [
+          { "time": 4.70, "value": 3 },
+          { "time": 4.99, "value": 3 },
+          { "time": 5.23, "value": 3 }
+        ]
+      },
+      "passing": { "total": 4, "events": [{ "time": 7.05, "value": 4 }] },
+      "defense": { "totalTimeHeld": 0.34, "events": [{ "time": 8.11, "duration": 0.34 }] }
+    },
+    "teleop": {
+      "fuel": {
+        "total": 28,
+        "events": [
+          { "time": 14.8, "value": 4 },
+          { "time": 16.3, "value": 4 },
+          { "time": 17.9, "value": 4 },
+          { "time": 19.5, "value": 4 },
+          { "time": 21.2, "value": 4 },
+          { "time": 22.8, "value": 4 },
+          { "time": 24.2, "value": 4 }
+        ]
+      },
+      "outpost": {
+        "total": 2,
+        "attempts": 3,
+        "successes": 2,
+        "fails": 1,
+        "accuracy": 0.67,
+        "events": [
+          { "time": 18.6, "value": 1, "result": "success" },
+          { "time": 20.4, "value": 1, "result": "fail" },
+          { "time": 23.3, "value": 1, "result": "success" }
+        ]
+      }
+    }
+  },
+  {
+    "match": 1,
+    "team": "9600",
+    "scouter": "Lena",
+    "bricked": false,
+    "slider": 51,
+    "good": "Very aggressive cycle speed.",
+    "bad": "Defense pressure dropped passing accuracy.",
+    "area": "Far side",
+    "p": [0.55, 0.47],
+    "ft": [0],
+    "auto": {
+      "fuel": { "total": 6, "events": [{ "time": 4.2, "value": 3 }, { "time": 4.5, "value": 3 }] },
+      "outpost": {
+        "total": 1,
+        "attempts": 2,
+        "successes": 1,
+        "fails": 1,
+        "accuracy": 0.5,
+        "events": [
+          { "time": 2.1, "value": 1, "result": "success" },
+          { "time": 2.7, "value": 1, "result": "fail" }
+        ]
+      }
+    },
+    "teleop": {
+      "fuel": { "total": 30, "events": [{ "time": 15.1, "value": 5 }, { "time": 17.0, "value": 5 }, { "time": 18.8, "value": 5 }, { "time": 20.7, "value": 5 }, { "time": 22.6, "value": 5 }, { "time": 24.4, "value": 5 }] },
+      "defense": { "totalTimeHeld": 1.12, "events": [{ "time": 19.2, "duration": 0.66 }, { "time": 25.1, "duration": 0.46 }] }
+    }
+  }
+]
