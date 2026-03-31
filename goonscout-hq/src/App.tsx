@@ -2,7 +2,7 @@ import * as React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { BarChart3, FileJson, Folder, Home, Plus, Search, Settings, Upload } from "lucide-react";
-import { Bar, BarChart, CartesianGrid, Cell, LabelList, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
+import { Bar, BarChart, CartesianGrid, Cell, LabelList, Legend, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { Button } from "@/components/ui/button";
 import MiniScoutField from "@/components/MiniScoutField";
@@ -40,6 +40,7 @@ type ProjectConfig = {
   matchContentHash: string;
   qualitativeContentHash: string;
   pitContentHash: string;
+  tagPointValues?: Record<string, number>;
   backgroundImage?: string | null;
   backgroundLocation?: string | null;
   fieldMapping?: unknown;
@@ -88,6 +89,19 @@ type DataTagVariantGroup = {
   key: DataMetricVariant;
   label: string;
   tagsByPhase: Partial<Record<"auto" | "teleop", string>>;
+};
+
+type AllianceSide = "red" | "blue";
+
+type AllianceContributionRow = {
+  alliance: "Red" | "Blue";
+  slot1: number;
+  slot2: number;
+  slot3: number;
+  total: number;
+  team1: string;
+  team2: string;
+  team3: string;
 };
 
 function parseHashRoute(hashValue: string): ParsedRoute {
@@ -329,10 +343,14 @@ function App() {
     matchContentHash: "",
     qualitativeContentHash: "",
     pitContentHash: "",
+    tagPointValues: {},
     backgroundImage: null,
     backgroundLocation: null,
     fieldMapping: null,
   });
+  const [configMatchHashDraft, setConfigMatchHashDraft] = React.useState("");
+  const [configQualitativeHashDraft, setConfigQualitativeHashDraft] = React.useState("");
+  const [configPitHashDraft, setConfigPitHashDraft] = React.useState("");
   const [configStatus, setConfigStatus] = React.useState("");
   const [isSavingConfig, setIsSavingConfig] = React.useState(false);
   const [decodeFieldMapping, setDecodeFieldMapping] = React.useState<ScoutingFieldMapping | null>(null);
@@ -340,12 +358,16 @@ function App() {
   const [projectSection, setProjectSection] = React.useState<ProjectSection>("overview");
   const [teamSearch, setTeamSearch] = React.useState("");
   const [teamNoteSearch, setTeamNoteSearch] = React.useState("");
+  const [teamQualitativeSearch, setTeamQualitativeSearch] = React.useState("");
+  const [teamPitSearch, setTeamPitSearch] = React.useState("");
   const [teamNumbers, setTeamNumbers] = React.useState<string[]>([]);
   const [selectedTeam, setSelectedTeam] = React.useState("");
   const [scoutSearch, setScoutSearch] = React.useState("");
   const [scoutNames, setScoutNames] = React.useState<string[]>([]);
   const [selectedScout, setSelectedScout] = React.useState("");
   const [jsonEntries, setJsonEntries] = React.useState<JsonEntry[]>([]);
+  const [qualitativeEntries, setQualitativeEntries] = React.useState<JsonEntry[]>([]);
+  const [pitEntries, setPitEntries] = React.useState<JsonEntry[]>([]);
   const [selectedDataXTag, setSelectedDataXTag] = React.useState("");
   const [selectedDataYTag, setSelectedDataYTag] = React.useState("");
   const [selectedDataYTagSecondary, setSelectedDataYTagSecondary] = React.useState("");
@@ -382,6 +404,16 @@ function App() {
   const [activePicklistId, setActivePicklistId] = React.useState<string>("default");
   const [newPicklistName, setNewPicklistName] = React.useState("");
   const [draggingPickTeam, setDraggingPickTeam] = React.useState<string | null>(null);
+  const [isSavingTagPoints, setIsSavingTagPoints] = React.useState(false);
+
+  const [redAllianceTeams, setRedAllianceTeams] = React.useState<[string, string, string]>(["", "", ""]);
+  const [blueAllianceTeams, setBlueAllianceTeams] = React.useState<[string, string, string]>(["", "", ""]);
+  const [compareScoreMode, setCompareScoreMode] = React.useState<"tag" | "phase">("tag");
+  const [compareMetricTagSelection, setCompareMetricTagSelection] = React.useState("");
+  const [compareMetricWeight, setCompareMetricWeight] = React.useState(1);
+  const [comparePhaseSelection, setComparePhaseSelection] = React.useState<"auto" | "teleop">("auto");
+  const [comparePhasePointValue, setComparePhasePointValue] = React.useState(1);
+  const [matchGeneralSearch, setMatchGeneralSearch] = React.useState("");
 
   React.useEffect(() => {
     const onHashChange = () => {
@@ -552,6 +584,10 @@ function App() {
             matchContentHash: String(loaded.matchContentHash ?? ""),
             qualitativeContentHash: String(loaded.qualitativeContentHash ?? ""),
             pitContentHash: String(loaded.pitContentHash ?? ""),
+            tagPointValues:
+              loaded.tagPointValues && typeof loaded.tagPointValues === "object" && !Array.isArray(loaded.tagPointValues)
+                ? (loaded.tagPointValues as Record<string, number>)
+                : {},
             backgroundImage: loaded.backgroundImage ?? null,
             backgroundLocation: loaded.backgroundLocation ?? null,
             fieldMapping: loaded.fieldMapping ?? null,
@@ -565,6 +601,7 @@ function App() {
             matchContentHash: "",
             qualitativeContentHash: "",
             pitContentHash: "",
+            tagPointValues: {},
             backgroundImage: null,
             backgroundLocation: null,
             fieldMapping: null,
@@ -580,6 +617,12 @@ function App() {
       isCancelled = true;
     };
   }, [route.kind, selectedProject]);
+
+  React.useEffect(() => {
+    setConfigMatchHashDraft(projectConfig.matchContentHash ?? "");
+    setConfigQualitativeHashDraft(projectConfig.qualitativeContentHash ?? "");
+    setConfigPitHashDraft(projectConfig.pitContentHash ?? "");
+  }, [projectConfig.matchContentHash, projectConfig.pitContentHash, projectConfig.qualitativeContentHash]);
 
   React.useEffect(() => {
     if ((route.kind !== "project" && route.kind !== "team" && route.kind !== "match") || !selectedProject) {
@@ -775,6 +818,77 @@ function App() {
     });
   }, [picklists, selectedProject]);
 
+  React.useEffect(() => {
+    if (!selectedProject) {
+      setQualitativeEntries([]);
+      setPitEntries([]);
+      return;
+    }
+
+    let isCancelled = false;
+
+    const normalizeEntries = (value: unknown): JsonEntry[] => {
+      if (!Array.isArray(value)) {
+        return [];
+      }
+
+      return value.filter((item): item is JsonEntry => Boolean(item && typeof item === "object" && !Array.isArray(item)));
+    };
+
+    const loadQualAndPitData = async () => {
+      const qualitativeHash = projectConfig.qualitativeContentHash?.trim() ?? "";
+      const pitHash = projectConfig.pitContentHash?.trim() ?? "";
+
+      if (!qualitativeHash) {
+        if (!isCancelled) {
+          setQualitativeEntries([]);
+        }
+      } else {
+        try {
+          const loaded = await invoke<unknown>("read_or_init_project_data_file", {
+            projectId: selectedProject.id,
+            fileName: "qual.json",
+            defaultContent: [],
+          });
+          if (!isCancelled) {
+            setQualitativeEntries(normalizeEntries(loaded));
+          }
+        } catch {
+          if (!isCancelled) {
+            setQualitativeEntries([]);
+          }
+        }
+      }
+
+      if (!pitHash) {
+        if (!isCancelled) {
+          setPitEntries([]);
+        }
+      } else {
+        try {
+          const loaded = await invoke<unknown>("read_or_init_project_data_file", {
+            projectId: selectedProject.id,
+            fileName: "pit.json",
+            defaultContent: [],
+          });
+          if (!isCancelled) {
+            setPitEntries(normalizeEntries(loaded));
+          }
+        } catch {
+          if (!isCancelled) {
+            setPitEntries([]);
+          }
+        }
+      }
+    };
+
+    void loadQualAndPitData();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [projectConfig.pitContentHash, projectConfig.qualitativeContentHash, selectedProject]);
+
   const filteredTeamNumbers = React.useMemo(() => {
     const term = teamSearch.trim().toLowerCase();
     if (!term) {
@@ -811,6 +925,53 @@ function App() {
 
     return Array.from(tags).sort((left, right) => left.localeCompare(right));
   }, [excludedDataTags, jsonEntries]);
+
+  const tagPointValueMap = React.useMemo(() => {
+    return projectConfig.tagPointValues ?? {};
+  }, [projectConfig.tagPointValues]);
+
+  const configurableTagBases = React.useMemo(() => {
+    const bases = new Set<string>();
+
+    for (const tag of allNumericTags) {
+      const split = splitMetricTag(tag);
+      if (!split) {
+        continue;
+      }
+
+      const parsed = parseMetricVariant(split.metric);
+      if (!parsed.variant) {
+        continue;
+      }
+
+      if (parsed.variant !== "value") {
+        continue;
+      }
+
+      bases.add(parsed.base);
+    }
+
+    return Array.from(bases.values()).sort((left, right) => left.localeCompare(right));
+  }, [allNumericTags]);
+
+  const getConfiguredTagPointValue = React.useCallback(
+    (tag: string): number => {
+      const split = splitMetricTag(tag);
+      if (!split) {
+        return 1;
+      }
+
+      const parsed = parseMetricVariant(split.metric);
+      const value = tagPointValueMap[parsed.base];
+
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+      }
+
+      return 1;
+    },
+    [tagPointValueMap],
+  );
 
   const dataTagGroups = React.useMemo(() => {
     const grouped = new Map<string, Map<DataMetricVariant, DataTagVariantGroup>>();
@@ -1424,6 +1585,122 @@ function App() {
     return selectedTeamNotes.filter((row) => `${row.good} ${row.bad} ${row.area}`.toLowerCase().includes(term));
   }, [selectedTeamNotes, teamNoteSearch]);
 
+  const selectedTeamQualitativeRows = React.useMemo(() => {
+    if (!activeTeam) {
+      return [] as Array<{
+        match: number;
+        scouter: string;
+        slot: string;
+        alliance: string;
+        notes: Array<{ field: string; note: string }>;
+        generalNotes: Array<{ field: string; note: string }>;
+      }>;
+    }
+
+    const rows = qualitativeEntries
+      .filter((entry) => {
+        const teamValue = entry.team;
+        const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+        return team === activeTeam;
+      })
+      .map((entry) => {
+        const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : 0;
+        const notes = Array.isArray(entry.notes)
+          ? entry.notes
+              .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+              .map((item) => ({
+                field: typeof item.field === "string" ? item.field : "note",
+                note: typeof item.note === "string" ? item.note : "",
+              }))
+              .filter((item) => item.note.trim().length > 0)
+          : [];
+
+        const generalNotes = Array.isArray(entry.generalNotes)
+          ? entry.generalNotes
+              .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+              .map((item) => ({
+                field: typeof item.field === "string" ? item.field : "general",
+                note: typeof item.note === "string" ? item.note : "",
+              }))
+              .filter((item) => item.note.trim().length > 0)
+          : [];
+
+        return {
+          match: Number.isFinite(matchValue) ? matchValue : 0,
+          scouter: typeof entry.scouter === "string" && entry.scouter.trim() ? entry.scouter : "Unknown",
+          slot: typeof entry.slot === "string" ? entry.slot : "",
+          alliance: typeof entry.alliance === "string" ? entry.alliance : "",
+          notes,
+          generalNotes,
+        };
+      });
+
+    return rows.sort((left, right) => right.match - left.match);
+  }, [activeTeam, qualitativeEntries]);
+
+  const filteredSelectedTeamQualitativeRows = React.useMemo(() => {
+    const term = teamQualitativeSearch.trim().toLowerCase();
+    if (!term) {
+      return selectedTeamQualitativeRows;
+    }
+
+    return selectedTeamQualitativeRows.filter((row) => {
+      const content = `${row.scouter} ${row.slot} ${row.alliance} ${row.notes.map((item) => `${item.field} ${item.note}`).join(" ")} ${row.generalNotes
+        .map((item) => `${item.field} ${item.note}`)
+        .join(" ")}`;
+      return content.toLowerCase().includes(term);
+    });
+  }, [selectedTeamQualitativeRows, teamQualitativeSearch]);
+
+  const selectedTeamPitRows = React.useMemo(() => {
+    if (!activeTeam) {
+      return [] as Array<{
+        match: number;
+        scouter: string;
+        answers: Array<{ questionNumber: number; question: string; answerLabel: string }>;
+      }>;
+    }
+
+    const rows = pitEntries
+      .filter((entry) => {
+        const teamValue = entry.team;
+        const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+        return team === activeTeam;
+      })
+      .map((entry) => {
+        const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : 0;
+        const answers = Array.isArray(entry.answers)
+          ? entry.answers
+              .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+              .map((item) => ({
+                questionNumber: typeof item.questionNumber === "number" ? item.questionNumber : 0,
+                question: typeof item.question === "string" ? item.question : "Question",
+                answerLabel: typeof item.answerLabel === "string" ? item.answerLabel : JSON.stringify(item.answer ?? ""),
+              }))
+          : [];
+
+        return {
+          match: Number.isFinite(matchValue) ? matchValue : 0,
+          scouter: typeof entry.scouter === "string" && entry.scouter.trim() ? entry.scouter : "Unknown",
+          answers,
+        };
+      });
+
+    return rows.sort((left, right) => right.match - left.match);
+  }, [activeTeam, pitEntries]);
+
+  const filteredSelectedTeamPitRows = React.useMemo(() => {
+    const term = teamPitSearch.trim().toLowerCase();
+    if (!term) {
+      return selectedTeamPitRows;
+    }
+
+    return selectedTeamPitRows.filter((row) => {
+      const content = `${row.scouter} ${row.answers.map((item) => `${item.question} ${item.answerLabel}`).join(" ")}`;
+      return content.toLowerCase().includes(term);
+    });
+  }, [selectedTeamPitRows, teamPitSearch]);
+
   const selectedTeamHasEventTracking = React.useMemo(() => {
     for (const entry of selectedTeamEntries) {
       for (const phase of ["auto", "teleop"] as const) {
@@ -1694,6 +1971,140 @@ function App() {
       setSelectedDataYTagSecondary("");
     }
   }, [allNumericTags, isAutoTeleopPair, selectedDataYTag, selectedDataYTagSecondary]);
+
+  const selectableCompareTags = React.useMemo(() => {
+    return allNumericTags.filter((tag) => {
+      const split = splitMetricTag(tag);
+      if (!split) {
+        return false;
+      }
+
+      const parsed = parseMetricVariant(split.metric);
+      return parsed.variant === "value";
+    });
+  }, [allNumericTags]);
+
+  React.useEffect(() => {
+    setCompareMetricTagSelection((previous) => {
+      if (previous && selectableCompareTags.includes(previous)) {
+        return previous;
+      }
+      return selectableCompareTags[0] ?? "";
+    });
+  }, [selectableCompareTags]);
+
+  const updateAllianceTeamInput = React.useCallback((side: AllianceSide, index: number, nextValue: string) => {
+    const sanitized = nextValue.replace(/\D+/g, "");
+
+    if (side === "red") {
+      setRedAllianceTeams((previous) => {
+        const next: [string, string, string] = [...previous] as [string, string, string];
+        next[index] = sanitized;
+        return next;
+      });
+      return;
+    }
+
+    setBlueAllianceTeams((previous) => {
+      const next: [string, string, string] = [...previous] as [string, string, string];
+      next[index] = sanitized;
+      return next;
+    });
+  }, []);
+
+  const averageMetricForTeam = React.useCallback(
+    (team: string, tag: string): number => {
+      if (!team || !tag) {
+        return 0;
+      }
+
+      let sum = 0;
+      let count = 0;
+
+      for (const entry of jsonEntries) {
+        const teamValue = entry.team;
+        const entryTeam = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+        if (!entryTeam || entryTeam !== team) {
+          continue;
+        }
+
+        const value = extractNumericValue(entry, tag);
+        if (value === null) {
+          continue;
+        }
+
+        sum += value;
+        count += 1;
+      }
+
+      return count > 0 ? sum / count : 0;
+    },
+    [extractNumericValue, jsonEntries],
+  );
+
+  const comparePhaseTags = React.useMemo(() => {
+    return selectableCompareTags.filter((tag) => tag.startsWith(`${comparePhaseSelection}.`));
+  }, [comparePhaseSelection, selectableCompareTags]);
+
+  const scoreTeamForCompare = React.useCallback(
+    (team: string): number => {
+      if (!team) {
+        return 0;
+      }
+
+      if (compareScoreMode === "tag") {
+        if (!compareMetricTagSelection) {
+          return 0;
+        }
+
+        const average = averageMetricForTeam(team, compareMetricTagSelection);
+        const configWeight = getConfiguredTagPointValue(compareMetricTagSelection);
+        return average * compareMetricWeight * configWeight;
+      }
+
+      let total = 0;
+      for (const tag of comparePhaseTags) {
+        const average = averageMetricForTeam(team, tag);
+        if (!Number.isFinite(average)) {
+          continue;
+        }
+
+        total += average * getConfiguredTagPointValue(tag) * comparePhasePointValue;
+      }
+
+      return total;
+    },
+    [
+      averageMetricForTeam,
+      compareMetricTagSelection,
+      compareMetricWeight,
+      comparePhasePointValue,
+      comparePhaseTags,
+      compareScoreMode,
+      getConfiguredTagPointValue,
+    ],
+  );
+
+  const allianceContributionRows = React.useMemo(() => {
+    const createRow = (alliance: "Red" | "Blue", teams: [string, string, string]): AllianceContributionRow => {
+      const slot1 = scoreTeamForCompare(teams[0]);
+      const slot2 = scoreTeamForCompare(teams[1]);
+      const slot3 = scoreTeamForCompare(teams[2]);
+
+      return {
+        alliance,
+        slot1,
+        slot2,
+        slot3,
+        total: slot1 + slot2 + slot3,
+        team1: teams[0] || "—",
+        team2: teams[1] || "—",
+        team3: teams[2] || "—",
+      };
+    };
+
+    return [createRow("Red", redAllianceTeams), createRow("Blue", blueAllianceTeams)];
+  }, [blueAllianceTeams, redAllianceTeams, scoreTeamForCompare]);
 
   const normalizedDataTeamSearch = React.useMemo(() => dataTeamSearch.trim().toLowerCase(), [dataTeamSearch]);
 
@@ -2052,6 +2463,7 @@ function App() {
         matchContentHash: contentHash,
         qualitativeContentHash: "",
         pitContentHash: "",
+        tagPointValues: {},
         backgroundImage: validation.background_image ?? null,
         backgroundLocation: validation.background_location ?? null,
         fieldMapping: validation.field_mapping ?? null,
@@ -2096,10 +2508,17 @@ function App() {
 
       const hashValue =
         kind === "match"
-          ? projectConfig.matchContentHash.trim()
+          ? configMatchHashDraft.trim()
           : kind === "qualitative"
-            ? projectConfig.qualitativeContentHash.trim()
-            : projectConfig.pitContentHash.trim();
+            ? configQualitativeHashDraft.trim()
+            : configPitHashDraft.trim();
+
+      const nextConfigWithDraftHash: ProjectConfig = {
+        ...projectConfig,
+        matchContentHash: kind === "match" ? hashValue : projectConfig.matchContentHash,
+        qualitativeContentHash: kind === "qualitative" ? hashValue : projectConfig.qualitativeContentHash,
+        pitContentHash: kind === "pit" ? hashValue : projectConfig.pitContentHash,
+      };
 
       setIsSavingConfig(true);
 
@@ -2116,7 +2535,7 @@ function App() {
           }
 
           const nextConfig: ProjectConfig = {
-            ...projectConfig,
+            ...nextConfigWithDraftHash,
             backgroundImage: validation.background_image ?? projectConfig.backgroundImage ?? null,
             backgroundLocation: validation.background_location ?? projectConfig.backgroundLocation ?? null,
             fieldMapping: validation.field_mapping ?? projectConfig.fieldMapping ?? null,
@@ -2135,8 +2554,9 @@ function App() {
 
         await invoke("save_project_config", {
           projectId: selectedProject.id,
-          config: projectConfig,
+          config: nextConfigWithDraftHash,
         });
+        setProjectConfig(nextConfigWithDraftHash);
         setConfigStatus(`${kind} hash cleared and saved.`);
       } catch (error) {
         setConfigStatus(`Unable to save ${kind} hash: ${String(error)}`);
@@ -2144,8 +2564,42 @@ function App() {
         setIsSavingConfig(false);
       }
     },
-    [projectConfig, selectedProject],
+    [configMatchHashDraft, configPitHashDraft, configQualitativeHashDraft, projectConfig, selectedProject],
   );
+
+  const setTagPointValue = React.useCallback((baseMetric: string, rawValue: string) => {
+    const parsed = Number(rawValue);
+    const safeValue = Number.isFinite(parsed) ? parsed : 0;
+
+    setProjectConfig((previous) => ({
+      ...previous,
+      tagPointValues: {
+        ...(previous.tagPointValues ?? {}),
+        [baseMetric]: safeValue,
+      },
+    }));
+  }, []);
+
+  const saveTagPointValues = React.useCallback(async () => {
+    if (!selectedProject) {
+      return;
+    }
+
+    setIsSavingTagPoints(true);
+
+    try {
+      await invoke("save_project_config", {
+        projectId: selectedProject.id,
+        config: projectConfig,
+      });
+
+      setConfigStatus("Tag point values saved.");
+    } catch (error) {
+      setConfigStatus(`Unable to save tag point values: ${String(error)}`);
+    } finally {
+      setIsSavingTagPoints(false);
+    }
+  }, [projectConfig, selectedProject]);
 
   const handleSetRootFolder = React.useCallback(async () => {
     if (isSettingRootFolder) {
@@ -2312,6 +2766,50 @@ function App() {
     return timelineEvents.sort((left, right) => left.time - right.time);
   }, [selectedMatchEntry]);
 
+  const selectedMatchGeneralQualitativeNotes = React.useMemo(() => {
+    if (route.kind !== "match") {
+      return [] as Array<{ team: string; scouter: string; notes: Array<{ field: string; note: string }> }>;
+    }
+
+    const rows = qualitativeEntries
+      .filter((entry) => {
+        const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : NaN;
+        return Number.isFinite(matchValue) && Number(matchValue) === route.match;
+      })
+      .map((entry) => {
+        const generalNotes = Array.isArray(entry.generalNotes)
+          ? entry.generalNotes
+              .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+              .map((item) => ({
+                field: typeof item.field === "string" ? item.field : "general",
+                note: typeof item.note === "string" ? item.note : "",
+              }))
+              .filter((item) => item.note.trim().length > 0)
+          : [];
+
+        return {
+          team: typeof entry.team === "string" ? entry.team : typeof entry.team === "number" ? String(entry.team) : "Unknown",
+          scouter: typeof entry.scouter === "string" && entry.scouter.trim() ? entry.scouter : "Unknown",
+          notes: generalNotes,
+        };
+      })
+      .filter((row) => row.notes.length > 0);
+
+    return rows.sort((left, right) => left.team.localeCompare(right.team, undefined, { numeric: true }));
+  }, [qualitativeEntries, route]);
+
+  const filteredMatchGeneralQualitativeNotes = React.useMemo(() => {
+    const term = matchGeneralSearch.trim().toLowerCase();
+    if (!term) {
+      return selectedMatchGeneralQualitativeNotes;
+    }
+
+    return selectedMatchGeneralQualitativeNotes.filter((row) => {
+      const content = `${row.team} ${row.scouter} ${row.notes.map((item) => `${item.field} ${item.note}`).join(" ")}`;
+      return content.toLowerCase().includes(term);
+    });
+  }, [matchGeneralSearch, selectedMatchGeneralQualitativeNotes]);
+
   const viewerPath = route.kind === "viewer" ? selectedProject?.json_file_path ?? "" : "";
 
   if (route.kind === "viewer") {
@@ -2334,7 +2832,13 @@ function App() {
           <div className="text-sm text-white/65">JSON Viewer</div>
         </header>
 
-        <JsonViewerPage initialPath={viewerPath} projectId={selectedProject?.id ?? route.projectId} fieldMapping={decodeFieldMapping} />
+        <JsonViewerPage
+          initialPath={viewerPath}
+          projectId={selectedProject?.id ?? route.projectId}
+          fieldMapping={decodeFieldMapping}
+          qualitativeContentHash={projectConfig.qualitativeContentHash}
+          pitContentHash={projectConfig.pitContentHash}
+        />
       </div>
     );
   }
@@ -2700,8 +3204,8 @@ function App() {
                 </div>
 
                 <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
-                  <p className="mb-2 text-xs uppercase tracking-wide text-white/55">All Qualitative Text</p>
-                  <Input value={teamNoteSearch} onChange={(event) => setTeamNoteSearch(event.currentTarget.value)} placeholder="Search notes..." className="mb-2 h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+                  <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Match Scouters</p>
+                  <Input value={teamNoteSearch} onChange={(event) => setTeamNoteSearch(event.currentTarget.value)} placeholder="Search match notes..." className="mb-2 h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
                   <div className="max-h-56 space-y-2 overflow-y-auto pr-1">
                     {filteredSelectedTeamNotes.map((note, index) => (
                       <button
@@ -2716,6 +3220,64 @@ function App() {
                         <p>Area: {highlightSearchTerm(note.area || "—", teamNoteSearch)}</p>
                       </button>
                     ))}
+                    {filteredSelectedTeamNotes.length === 0 ? <p className="text-xs text-white/50">No match scouter notes found.</p> : null}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                  <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Qualitative Scouters</p>
+                  <Input
+                    value={teamQualitativeSearch}
+                    onChange={(event) => setTeamQualitativeSearch(event.currentTarget.value)}
+                    placeholder="Search qualitative notes..."
+                    className="mb-2 h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                  />
+                  <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                    {filteredSelectedTeamQualitativeRows.map((row, index) => (
+                      <div key={`qual-team-route-${row.match}-${row.scouter}-${index}`} className="rounded border border-white/10 bg-slate-900/50 p-2 text-xs text-white/80">
+                        <p className="font-semibold text-white">Match {row.match} • {row.scouter} • {row.alliance.toUpperCase()} {row.slot.toUpperCase()}</p>
+                        {row.notes.map((item, noteIndex) => (
+                          <p key={`qual-note-${index}-${noteIndex}`} className="mt-1">
+                            <span className="text-white/60">{item.field}: </span>
+                            {highlightSearchTerm(item.note || "—", teamQualitativeSearch)}
+                          </p>
+                        ))}
+                        {row.generalNotes.length > 0 ? <p className="mt-2 text-[11px] uppercase tracking-wide text-white/45">General</p> : null}
+                        {row.generalNotes.map((item, noteIndex) => (
+                          <p key={`qual-general-${index}-${noteIndex}`}>
+                            <span className="text-white/60">{item.field}: </span>
+                            {highlightSearchTerm(item.note || "—", teamQualitativeSearch)}
+                          </p>
+                        ))}
+                      </div>
+                    ))}
+                    {filteredSelectedTeamQualitativeRows.length === 0 ? <p className="text-xs text-white/50">No qualitative notes found for this team.</p> : null}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                  <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Pit Scouts</p>
+                  <Input
+                    value={teamPitSearch}
+                    onChange={(event) => setTeamPitSearch(event.currentTarget.value)}
+                    placeholder="Search pit responses..."
+                    className="mb-2 h-9 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                  />
+                  <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+                    {filteredSelectedTeamPitRows.map((row, index) => (
+                      <div key={`pit-team-route-${row.match}-${row.scouter}-${index}`} className="rounded border border-white/10 bg-slate-900/55 p-2 text-xs text-white/80">
+                        <p className="mb-2 font-semibold text-white">Match {row.match} • {row.scouter}</p>
+                        <div className="space-y-1">
+                          {row.answers.map((answer, answerIndex) => (
+                            <div key={`pit-answer-${index}-${answerIndex}`} className="flex items-start justify-between gap-3 border-b border-white/5 pb-1 last:border-b-0 last:pb-0">
+                              <p className="text-white/65">{answer.questionNumber}. {answer.question}</p>
+                              <p className="max-w-[45%] text-right text-white">{highlightSearchTerm(answer.answerLabel || "—", teamPitSearch)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {filteredSelectedTeamPitRows.length === 0 ? <p className="text-xs text-white/50">No pit responses found for this team.</p> : null}
                   </div>
                 </div>
               </div>
@@ -2728,7 +3290,7 @@ function App() {
   }
 
   if (route.kind === "match") {
-    const notesSearch = (search || "").trim().toLowerCase();
+    const notesSearch = (matchGeneralSearch || "").trim().toLowerCase();
     const goodText = typeof selectedMatchEntry?.good === "string" ? selectedMatchEntry.good : "";
     const badText = typeof selectedMatchEntry?.bad === "string" ? selectedMatchEntry.bad : "";
     const areaText = typeof selectedMatchEntry?.area === "string" ? selectedMatchEntry.area : "";
@@ -2801,7 +3363,12 @@ function App() {
 
             <section className="space-y-4 rounded-2xl border border-white/10 bg-slate-950/60 p-4 xl:col-span-5">
               <h2 className="text-lg font-semibold text-white">Notes + Qualitative</h2>
-              <Input value={search} onChange={(event) => setSearch(event.currentTarget.value)} placeholder="Find note keywords..." className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35" />
+              <Input
+                value={matchGeneralSearch}
+                onChange={(event) => setMatchGeneralSearch(event.currentTarget.value)}
+                placeholder="Find note keywords..."
+                className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+              />
               <p className="text-xs text-white/60">Matching note blocks: {noteMatchCount}</p>
 
               <div className="space-y-2">
@@ -2832,6 +3399,27 @@ function App() {
                     ))}
                   </div>
                 )}
+              </div>
+
+              <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
+                <p className="mb-2 text-sm font-semibold text-white">General Qualitative Notes</p>
+                <div className="max-h-48 space-y-2 overflow-y-auto pr-1 text-xs text-white/80">
+                  {filteredMatchGeneralQualitativeNotes.length === 0 ? (
+                    <p className="text-white/55">No general qualitative notes found for this match.</p>
+                  ) : (
+                    filteredMatchGeneralQualitativeNotes.map((row, index) => (
+                      <div key={`match-general-${row.team}-${row.scouter}-${index}`} className="rounded border border-white/10 bg-slate-950/60 p-2">
+                        <p className="font-semibold text-white">Team {row.team} • {row.scouter}</p>
+                        {row.notes.map((item, noteIndex) => (
+                          <p key={`match-general-note-${index}-${noteIndex}`} className="mt-1">
+                            <span className="text-white/55">{item.field}: </span>
+                            {highlightSearchTerm(item.note || "—", matchGeneralSearch)}
+                          </p>
+                        ))}
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             </section>
           </div>
@@ -2936,7 +3524,14 @@ function App() {
                   <p className="text-sm text-white/80">Folder: {selectedProject.folder_path}</p>
                   <p className="mt-2 text-sm text-white/80">Scanner JSON: {selectedProject.json_file_path ?? "No JSON file yet"}</p>
                 </div>
-                <JsonViewerPage initialPath={selectedProject.json_file_path ?? ""} projectId={selectedProject.id} fieldMapping={decodeFieldMapping} embedded />
+                <JsonViewerPage
+                  initialPath={selectedProject.json_file_path ?? ""}
+                  projectId={selectedProject.id}
+                  fieldMapping={decodeFieldMapping}
+                  qualitativeContentHash={projectConfig.qualitativeContentHash}
+                  pitContentHash={projectConfig.pitContentHash}
+                  embedded
+                />
               </div>
             ) : projectSection === "config" ? (
               <div className="space-y-4">
@@ -2947,8 +3542,8 @@ function App() {
                   <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
                     <p className="mb-2 text-sm font-semibold text-white">Match Content Hash</p>
                     <Input
-                      value={projectConfig.matchContentHash}
-                      onChange={(event) => setProjectConfig((previous) => ({ ...previous, matchContentHash: event.currentTarget.value }))}
+                      value={configMatchHashDraft}
+                      onChange={(event) => setConfigMatchHashDraft(event.currentTarget.value)}
                       placeholder="Enter match hash"
                       className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
                     />
@@ -2965,8 +3560,8 @@ function App() {
                   <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
                     <p className="mb-2 text-sm font-semibold text-white">Qualitative Content Hash</p>
                     <Input
-                      value={projectConfig.qualitativeContentHash}
-                      onChange={(event) => setProjectConfig((previous) => ({ ...previous, qualitativeContentHash: event.currentTarget.value }))}
+                      value={configQualitativeHashDraft}
+                      onChange={(event) => setConfigQualitativeHashDraft(event.currentTarget.value)}
                       placeholder="Enter qualitative hash"
                       className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
                     />
@@ -2983,8 +3578,8 @@ function App() {
                   <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
                     <p className="mb-2 text-sm font-semibold text-white">Pit Content Hash</p>
                     <Input
-                      value={projectConfig.pitContentHash}
-                      onChange={(event) => setProjectConfig((previous) => ({ ...previous, pitContentHash: event.currentTarget.value }))}
+                      value={configPitHashDraft}
+                      onChange={(event) => setConfigPitHashDraft(event.currentTarget.value)}
                       placeholder="Enter pit hash"
                       className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
                     />
@@ -2999,16 +3594,214 @@ function App() {
                   </div>
                 </div>
 
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Tag Point Values</p>
+                      <p className="text-xs text-white/65">Points are shared across auto and teleop for the same base tag.</p>
+                    </div>
+                    <Button
+                      type="button"
+                      className="bg-blue-600 text-white hover:bg-blue-500"
+                      onClick={() => void saveTagPointValues()}
+                      disabled={isSavingTagPoints}
+                    >
+                      {isSavingTagPoints ? "Saving..." : "Save Tag Points"}
+                    </Button>
+                  </div>
+
+                  {configurableTagBases.length === 0 ? (
+                    <p className="text-sm text-white/60">No base tags discovered yet. Load match data to populate this list.</p>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                      {configurableTagBases.map((baseTag) => (
+                        <label key={`tag-points-${baseTag}`} className="flex items-center justify-between rounded-lg border border-white/15 bg-slate-950/70 px-3 py-2 text-sm text-white/85">
+                          <span className="mr-3 truncate">{baseTag}</span>
+                          <input
+                            type="number"
+                            step="0.1"
+                            value={String((projectConfig.tagPointValues ?? {})[baseTag] ?? 1)}
+                            onChange={(event) => setTagPointValue(baseTag, event.currentTarget.value)}
+                            className="h-8 w-24 rounded border border-white/20 bg-slate-900 px-2 text-right text-white outline-none"
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
                 {configStatus ? <p className="text-sm text-white/80">{configStatus}</p> : null}
                 {projectConfig.backgroundImage ? <p className="text-xs text-white/55">Resolved background image: {projectConfig.backgroundImage}</p> : null}
               </div>
             ) : projectSection === "compare" ? (
               <div className="space-y-4">
                 <h1 className="text-3xl font-semibold tracking-tight">Compare</h1>
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-                  <div className="rounded-xl border border-white/10 bg-slate-900/60 p-4 text-sm text-white/80">Compare module: Coming soon</div>
-                  <div className="rounded-xl border border-white/10 bg-slate-900/60 p-4 text-sm text-white/80">Project-to-project diff: Coming soon</div>
-                  <div className="rounded-xl border border-white/10 bg-slate-900/60 p-4 text-sm text-white/80">Metrics sync: Coming soon</div>
+                <p className="text-white/70">Create imaginary red/blue alliances, then compare weighted score output.</p>
+
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                  <div className="rounded-xl border border-red-400/40 bg-red-950/20 p-4">
+                    <p className="mb-3 text-sm font-semibold text-red-200">Red Alliance</p>
+                    <div className="space-y-2">
+                      {redAllianceTeams.map((team, index) => (
+                        <Input
+                          key={`red-team-${index}`}
+                          value={team}
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          onChange={(event) => updateAllianceTeamInput("red", index, event.currentTarget.value)}
+                          placeholder={`Red team ${index + 1}`}
+                          className="h-10 border-red-300/25 bg-slate-900/80 text-white placeholder:text-white/35"
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-blue-400/40 bg-blue-950/20 p-4">
+                    <p className="mb-3 text-sm font-semibold text-blue-200">Blue Alliance</p>
+                    <div className="space-y-2">
+                      {blueAllianceTeams.map((team, index) => (
+                        <Input
+                          key={`blue-team-${index}`}
+                          value={team}
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          onChange={(event) => updateAllianceTeamInput("blue", index, event.currentTarget.value)}
+                          placeholder={`Blue team ${index + 1}`}
+                          className="h-10 border-blue-300/25 bg-slate-900/80 text-white placeholder:text-white/35"
+                        />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+                    <label className="space-y-1 text-sm text-white/80">
+                      <span>Scoring Mode</span>
+                      <select
+                        value={compareScoreMode}
+                        onChange={(event) => setCompareScoreMode(event.currentTarget.value as "tag" | "phase")}
+                        className="h-10 w-full rounded-md border border-white/15 bg-slate-900 px-2 text-sm text-white"
+                      >
+                        <option value="tag">Single Tag</option>
+                        <option value="phase">Auto / Teleop Total</option>
+                      </select>
+                    </label>
+
+                    {compareScoreMode === "tag" ? (
+                      <>
+                        <label className="space-y-1 text-sm text-white/80 md:col-span-2">
+                          <span>Metric / Tag</span>
+                          <select
+                            value={compareMetricTagSelection}
+                            onChange={(event) => setCompareMetricTagSelection(event.currentTarget.value)}
+                            className="h-10 w-full rounded-md border border-white/15 bg-slate-900 px-2 text-sm text-white"
+                          >
+                            {selectableCompareTags.map((tag) => (
+                              <option key={`compare-tag-${tag}`} value={tag}>
+                                {formatMetricTagLabel(tag)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="space-y-1 text-sm text-white/80">
+                          <span>Extra Weight</span>
+                          <input
+                            type="number"
+                            step="0.1"
+                            value={String(compareMetricWeight)}
+                            onChange={(event) => {
+                              const value = Number(event.currentTarget.value);
+                              setCompareMetricWeight(Number.isFinite(value) ? value : 0);
+                            }}
+                            className="h-10 w-full rounded border border-white/20 bg-slate-900 px-2 text-white outline-none"
+                          />
+                        </label>
+                      </>
+                    ) : (
+                      <>
+                        <label className="space-y-1 text-sm text-white/80">
+                          <span>Phase</span>
+                          <select
+                            value={comparePhaseSelection}
+                            onChange={(event) => setComparePhaseSelection(event.currentTarget.value as "auto" | "teleop")}
+                            className="h-10 w-full rounded-md border border-white/15 bg-slate-900 px-2 text-sm text-white"
+                          >
+                            <option value="auto">Auto</option>
+                            <option value="teleop">Teleop</option>
+                          </select>
+                        </label>
+
+                        <label className="space-y-1 text-sm text-white/80">
+                          <span>Points Per Action</span>
+                          <input
+                            type="number"
+                            step="0.1"
+                            value={String(comparePhasePointValue)}
+                            onChange={(event) => {
+                              const value = Number(event.currentTarget.value);
+                              setComparePhasePointValue(Number.isFinite(value) ? value : 0);
+                            }}
+                            className="h-10 w-full rounded border border-white/20 bg-slate-900 px-2 text-white outline-none"
+                          />
+                        </label>
+
+                        <div className="flex items-end text-xs text-white/65 md:col-span-2">
+                          {comparePhaseTags.length} tags included from {comparePhaseSelection}.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                  <p className="mb-2 text-sm text-white/75">Alliance Contribution Graph</p>
+                  <div className="h-[360px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={allianceContributionRows} margin={{ top: 12, right: 18, left: 8, bottom: 12 }}>
+                        <CartesianGrid stroke="rgba(255,255,255,0.12)" strokeDasharray="3 3" />
+                        <XAxis dataKey="alliance" tick={{ fill: "rgba(255,255,255,0.8)", fontSize: 12 }} />
+                        <YAxis tick={{ fill: "rgba(255,255,255,0.8)", fontSize: 12 }} />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: "rgba(2,6,23,0.95)",
+                            border: "1px solid rgba(255,255,255,0.15)",
+                            borderRadius: "0.75rem",
+                            color: "white",
+                          }}
+                          formatter={(value, key, item) => {
+                            const row = item.payload as AllianceContributionRow;
+                            const numeric = typeof value === "number" ? value : Number(value);
+                            const teamLabel = key === "slot1" ? row.team1 : key === "slot2" ? row.team2 : row.team3;
+                            return [Number.isFinite(numeric) ? numeric.toFixed(2) : String(value), `Team ${teamLabel}`];
+                          }}
+                        />
+                        <Legend
+                          formatter={(value) => {
+                            if (value === "slot1") {
+                              return "Team 1";
+                            }
+                            if (value === "slot2") {
+                              return "Team 2";
+                            }
+                            return "Team 3";
+                          }}
+                        />
+                        <Bar dataKey="slot1" stackId="alliance" fill="#f97316" radius={[6, 6, 0, 0]} />
+                        <Bar dataKey="slot2" stackId="alliance" fill="#22c55e" radius={[6, 6, 0, 0]} />
+                        <Bar dataKey="slot3" stackId="alliance" fill="#0ea5e9" radius={[6, 6, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="mt-3 grid grid-cols-1 gap-2 text-sm md:grid-cols-2">
+                    <div className="rounded-lg border border-red-400/30 bg-red-950/20 px-3 py-2 text-red-100">
+                      Red Total: {allianceContributionRows[0]?.total.toFixed(2) ?? "0.00"}
+                    </div>
+                    <div className="rounded-lg border border-blue-400/30 bg-blue-950/20 px-3 py-2 text-blue-100">
+                      Blue Total: {allianceContributionRows[1]?.total.toFixed(2) ?? "0.00"}
+                    </div>
+                  </div>
                 </div>
               </div>
             ) : projectSection === "picklist" ? (
