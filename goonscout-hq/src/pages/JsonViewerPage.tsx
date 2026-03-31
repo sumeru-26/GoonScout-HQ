@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { decodePitScoutingEntry, decodeQualitativeScoutingEntry, detectScoutType, extractRawEntries } from "@/lib/multiScoutDecode";
 import { normalizeScoutingDataset, type ScoutingFieldMapping } from "@/lib/scoutingPayload";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -31,9 +32,25 @@ type JsonViewerPageProps = {
   embedded?: boolean;
   projectId?: string;
   fieldMapping?: ScoutingFieldMapping | null;
+  qualitativeContentHash?: string;
+  pitContentHash?: string;
 };
 
-//test
+type ContentHashValidationResult = {
+  valid: boolean;
+  message: string;
+  field_mapping?: unknown;
+  payload?: unknown;
+};
+
+function isScoutingFieldMapping(value: unknown): value is ScoutingFieldMapping {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const mappingValue = (value as { mapping?: unknown }).mapping;
+  return Boolean(mappingValue && typeof mappingValue === "object" && !Array.isArray(mappingValue));
+}
 
 function pathEquals(left: JsonPath, right: JsonPath): boolean {
   if (left.length !== right.length) {
@@ -168,7 +185,14 @@ function parseDraftValue(previousValue: JsonValue, draft: string): JsonValue {
   return JSON.parse(draft) as JsonValue;
 }
 
-function JsonViewerPage({ initialPath = "", embedded = false, projectId, fieldMapping }: JsonViewerPageProps) {
+function JsonViewerPage({
+  initialPath = "",
+  embedded = false,
+  projectId,
+  fieldMapping,
+  qualitativeContentHash = "",
+  pitContentHash = "",
+}: JsonViewerPageProps) {
   const [path, setPath] = useState(initialPath);
   const [jsonContent, setJsonContent] = useState("");
   const [jsonData, setJsonData] = useState<JsonValue | null>(null);
@@ -658,49 +682,129 @@ function JsonViewerPage({ initialPath = "", embedded = false, projectId, fieldMa
     stopScanner();
 
     const trimmedPath = path.trim();
-    if (!trimmedPath) {
+    if (!projectId && !trimmedPath) {
       setStatus("Select a JSON path first before scanning.");
       return;
     }
 
     try {
-      if (!fieldMapping || !fieldMapping.mapping || Object.keys(fieldMapping.mapping).length === 0) {
-        throw new Error("Field mapping is required before scanning compressed payloads.");
-      }
-
       const parsedPayload = JSON.parse(payload) as unknown;
-      const normalizedEntries = normalizeScoutingDataset(parsedPayload, {
-        fieldMapping,
-        compressedOnly: true,
-        requireFieldMapping: true,
-      });
-      if (normalizedEntries.length === 0) {
-        throw new Error("Scanned payload did not contain a valid scouting entry.");
-      }
-
-      const payloadRoot = parsedPayload && typeof parsedPayload === "object" && !Array.isArray(parsedPayload)
-        ? (parsedPayload as Record<string, unknown>)
-        : null;
-      const rawEntries = Array.isArray(parsedPayload)
-        ? parsedPayload
-        : payloadRoot && Array.isArray(payloadRoot.data)
-          ? payloadRoot.data
-          : payloadRoot
-            ? [payloadRoot]
-            : [];
+      const rawEntries = extractRawEntries(parsedPayload);
 
       const rawEntry = rawEntries[0];
-      if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      if (!rawEntry) {
         throw new Error("Scanned payload entry format is invalid.");
       }
 
-      await invoke("append_json_entry", {
-        path: trimmedPath,
-        entryJson: JSON.stringify(rawEntry),
+      const scoutType = detectScoutType(rawEntry);
+      if (!scoutType) {
+        throw new Error("Unable to detect scoutType. QR payload must include scoutType or ft.");
+      }
+
+      if (scoutType === "match") {
+        if (!fieldMapping || !fieldMapping.mapping || Object.keys(fieldMapping.mapping).length === 0) {
+          throw new Error("Field mapping is required before scanning compressed match payloads.");
+        }
+
+        const normalizedEntries = normalizeScoutingDataset(rawEntry, {
+          fieldMapping,
+          compressedOnly: true,
+          requireFieldMapping: true,
+        });
+        if (normalizedEntries.length === 0) {
+          throw new Error("Scanned match payload did not contain a valid scouting entry.");
+        }
+
+        if (projectId) {
+          await invoke("append_project_scan_entries", {
+            projectId,
+            scoutType: "match",
+            entries: [rawEntry],
+          });
+
+          if (trimmedPath) {
+            await loadJsonFromPath(trimmedPath);
+          }
+          setStatus("Match QR inserted at the top of data.json successfully.");
+          return;
+        }
+
+        await invoke("append_json_entry", {
+          path: trimmedPath,
+          entryJson: JSON.stringify(rawEntry),
+        });
+
+        await loadJsonFromPath(trimmedPath);
+        setStatus("Match QR inserted at the top successfully.");
+        return;
+      }
+
+      if (!projectId) {
+        throw new Error(`${scoutType} scans require a project context.`);
+      }
+
+      if (scoutType === "qualitative") {
+        const hash = qualitativeContentHash.trim();
+        if (!hash) {
+          throw new Error("Qualitative content hash is not configured. Add it in Config before scanning qualitative QR codes.");
+        }
+
+        const validation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+          contentHash: hash,
+          expectedScoutType: "qualitative",
+        });
+        if (!validation.valid) {
+          throw new Error(validation.message || "Qualitative content hash validation failed.");
+        }
+        if (!isScoutingFieldMapping(validation.field_mapping)) {
+          throw new Error("Qualitative field mapping is missing or invalid for this hash.");
+        }
+
+        const decodedEntries = await decodeQualitativeScoutingEntry(
+          rawEntry,
+          validation.field_mapping,
+          async (matchKey) => {
+            try {
+              return await invoke("fetch_tba_match", { matchKey });
+            } catch {
+              return null;
+            }
+          },
+        );
+
+        await invoke("append_project_scan_entries", {
+          projectId,
+          scoutType: "qualitative",
+          entries: decodedEntries,
+        });
+
+        setStatus(`Qualitative QR decoded and saved to qual.json (${decodedEntries.length} team entries).`);
+        return;
+      }
+
+      const pitHash = pitContentHash.trim();
+      if (!pitHash) {
+        throw new Error("Pit content hash is not configured. Add it in Config before scanning pit QR codes.");
+      }
+
+      const pitValidation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+        contentHash: pitHash,
+        expectedScoutType: "pit",
+      });
+      if (!pitValidation.valid) {
+        throw new Error(pitValidation.message || "Pit content hash validation failed.");
+      }
+
+      const decodedPitEntry = decodePitScoutingEntry(rawEntry, pitValidation.payload ?? null);
+
+      await invoke("append_project_scan_entries", {
+        projectId,
+        scoutType: "pit",
+        entries: [decodedPitEntry],
       });
 
-      await loadJsonFromPath(trimmedPath);
-      setStatus("QR JSON inserted at the top successfully.");
+      setStatus("Pit QR decoded and saved to pit.json.");
+      return;
     } catch (error) {
       setStatus(`QR scan found data but append failed: ${String(error)}`);
     }

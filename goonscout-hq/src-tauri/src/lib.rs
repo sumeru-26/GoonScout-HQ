@@ -55,6 +55,7 @@ fn default_project_config() -> serde_json::Value {
         "matchContentHash": "",
         "qualitativeContentHash": "",
         "pitContentHash": "",
+        "tagPointValues": {},
         "backgroundImage": null,
         "backgroundLocation": null,
         "fieldMapping": null,
@@ -416,7 +417,12 @@ fn list_json_files_in_folder(folder: &Path) -> Result<Vec<PathBuf>, String> {
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        if file_name == "project.config.json" || file_name == "metrics.json" || file_name == "picklists.json" {
+        if file_name == "project.config.json"
+            || file_name == "metrics.json"
+            || file_name == "picklists.json"
+            || file_name == "qual.json"
+            || file_name == "pit.json"
+        {
             continue;
         }
 
@@ -1084,6 +1090,127 @@ fn append_json_entry(path: String, entry_json: String) -> Result<(), String> {
         .map_err(|error| format!("Could not write file '{}': {}", trimmed_path, error))
 }
 
+fn project_config_has_nonempty_hash(project_id: &str, hash_key: &str) -> Result<bool, String> {
+    let config_path = project_config_file_path(project_id)?;
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "Could not read project config '{}': {}",
+            config_path.display(),
+            error
+        )
+    })?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "Could not parse project config '{}': {}",
+            config_path.display(),
+            error
+        )
+    })?;
+
+    Ok(parsed
+        .get(hash_key)
+        .and_then(|value| value.as_str())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false))
+}
+
+fn ensure_scan_file_for_scout_type(project_id: &str, scout_type: &str) -> Result<PathBuf, String> {
+    let file_name = match scout_type {
+        "match" => "data.json",
+        "qualitative" => {
+            let has_hash = project_config_has_nonempty_hash(project_id, "qualitativeContentHash")?;
+            if !has_hash {
+                return Err(
+                    "Qualitative content hash is not configured. Add it in Config before scanning qualitative QR codes.".into(),
+                );
+            }
+            "qual.json"
+        }
+        "pit" => {
+            let has_hash = project_config_has_nonempty_hash(project_id, "pitContentHash")?;
+            if !has_hash {
+                return Err("Pit content hash is not configured. Add it in Config before scanning pit QR codes.".into());
+            }
+            "pit.json"
+        }
+        _ => return Err(format!("Unsupported scout type '{}'.", scout_type)),
+    };
+
+    let file_path = project_data_file_path(project_id, file_name)?;
+    if !file_path.exists() {
+        fs::write(&file_path, "[]\n").map_err(|error| {
+            format!(
+                "Could not create scan data file '{}': {}",
+                file_path.display(),
+                error
+            )
+        })?;
+    }
+
+    Ok(file_path)
+}
+
+#[tauri::command]
+fn append_project_scan_entries(
+    project_id: String,
+    scout_type: String,
+    entries: Vec<serde_json::Value>,
+) -> Result<String, String> {
+    let project_id_trimmed = project_id.trim();
+    if project_id_trimmed.is_empty() {
+        return Err("Project ID cannot be empty.".into());
+    }
+
+    if entries.is_empty() {
+        return Err("No scan entries were provided to append.".into());
+    }
+
+    let scout_type_trimmed = scout_type.trim().to_lowercase();
+    if scout_type_trimmed.is_empty() {
+        return Err("Scout type cannot be empty.".into());
+    }
+
+    let file_path = ensure_scan_file_for_scout_type(project_id_trimmed, scout_type_trimmed.as_str())?;
+
+    let raw_content = fs::read_to_string(&file_path).map_err(|error| {
+        format!(
+            "Could not read scan data file '{}': {}",
+            file_path.display(),
+            error
+        )
+    })?;
+
+    let mut root_value: serde_json::Value = serde_json::from_str(&raw_content)
+        .map_err(|error| format!("Could not parse scan data file '{}': {}", file_path.display(), error))?;
+
+    let array = root_value
+        .as_array_mut()
+        .ok_or("Scan data file root must be a JSON array.")?;
+
+    // Insert newest entries at top while preserving caller-provided order.
+    for entry in entries.into_iter().rev() {
+        array.insert(0, entry);
+    }
+
+    let normalized = serde_json::to_string_pretty(&root_value)
+        .map_err(|error| format!("Could not format updated scan JSON: {}", error))?;
+
+    fs::write(&file_path, format!("{}\n", normalized)).map_err(|error| {
+        format!(
+            "Could not write scan data file '{}': {}",
+            file_path.display(),
+            error
+        )
+    })?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1093,6 +1220,7 @@ pub fn run() {
             read_json_file,
             write_json_file,
             append_json_entry,
+            append_project_scan_entries,
             get_goonhq_workspace_overview,
             get_workspace_settings,
             set_workspace_root,
