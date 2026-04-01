@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize)]
 struct ProjectFolder {
@@ -46,6 +46,14 @@ struct ContentHashValidationResult {
     background_location: Option<String>,
 }
 
+#[derive(Serialize)]
+struct DataShareSyncResult {
+    share_code: String,
+    match_count: usize,
+    qual_count: usize,
+    pit_count: usize,
+}
+
 fn project_config_file_path(project_id: &str) -> Result<PathBuf, String> {
     Ok(resolve_project_folder(project_id)?.join("project.config.json"))
 }
@@ -55,6 +63,7 @@ fn default_project_config() -> serde_json::Value {
         "matchContentHash": "",
         "qualitativeContentHash": "",
         "pitContentHash": "",
+        "dataShareCode": "",
         "tagPointValues": {},
         "backgroundImage": null,
         "backgroundLocation": null,
@@ -389,6 +398,46 @@ fn get_supabase_credentials() -> Result<(String, String), String> {
     }
 
     Ok((trimmed_url, trimmed_key))
+}
+
+fn normalize_share_code(share_code: &str) -> Result<String, String> {
+    let digits = share_code
+        .chars()
+        .filter(|value| value.is_ascii_digit())
+        .collect::<String>();
+
+    if digits.len() != 6 {
+        return Err("Share code must be exactly 6 digits.".into());
+    }
+
+    Ok(digits)
+}
+
+fn build_data_sharing_query_url(supabase_url: &str, share_code: &str, select: &str) -> String {
+    format!(
+        "{}/rest/v1/data_sharing?share_code=eq.{}&select={}&limit=1",
+        supabase_url, share_code, select
+    )
+}
+
+fn generate_share_code_candidate(attempt: u32) -> String {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mixed = seed
+        ^ ((std::process::id() as u128) << 17)
+        ^ ((attempt as u128 + 1) * 97_291u128);
+    let code = (mixed % 1_000_000u128) as u32;
+    format!("{:06}", code)
+}
+
+fn ensure_json_array(value: serde_json::Value, label: &str) -> Result<Vec<serde_json::Value>, String> {
+    match value {
+        serde_json::Value::Array(entries) => Ok(entries),
+        serde_json::Value::Null => Ok(Vec::new()),
+        _ => Err(format!("{} must be a JSON array.", label)),
+    }
 }
 
 fn list_json_files_in_folder(folder: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1211,6 +1260,280 @@ fn append_project_scan_entries(
     Ok(file_path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn validate_data_share_code(share_code: String) -> Result<bool, String> {
+    let normalized_code = normalize_share_code(&share_code)?;
+    let (supabase_url, supabase_key) = get_supabase_credentials()?;
+    let request_url = build_data_sharing_query_url(&supabase_url, &normalized_code, "share_code");
+
+    let response = Client::new()
+        .get(request_url)
+        .header("apikey", supabase_key.as_str())
+        .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .map_err(|error| format!("Supabase request failed: {}", error))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let details = response.text().unwrap_or_default();
+        return Err(format!(
+            "Supabase returned HTTP {} while validating share code. {}",
+            status, details
+        ));
+    }
+
+    let rows: Vec<serde_json::Value> = response
+        .json()
+        .map_err(|error| format!("Could not parse Supabase response JSON: {}", error))?;
+
+    Ok(!rows.is_empty())
+}
+
+#[tauri::command]
+fn create_data_share_code(project_id: String) -> Result<String, String> {
+    let project_id_trimmed = project_id.trim();
+    if project_id_trimmed.is_empty() {
+        return Err("Project ID cannot be empty.".into());
+    }
+
+    resolve_project_folder(project_id_trimmed)?;
+
+    let (supabase_url, supabase_key) = get_supabase_credentials()?;
+    let client = Client::new();
+
+    for attempt in 0..40u32 {
+        let candidate = generate_share_code_candidate(attempt);
+        let check_url = build_data_sharing_query_url(&supabase_url, &candidate, "share_code");
+
+        let check_response = client
+            .get(check_url)
+            .header("apikey", supabase_key.as_str())
+            .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+            .header(CONTENT_TYPE, "application/json")
+            .send()
+            .map_err(|error| format!("Supabase request failed: {}", error))?;
+
+        if !check_response.status().is_success() {
+            let status = check_response.status().as_u16();
+            let details = check_response.text().unwrap_or_default();
+            return Err(format!(
+                "Supabase returned HTTP {} while checking share code availability. {}",
+                status, details
+            ));
+        }
+
+        let existing_rows: Vec<serde_json::Value> = check_response
+            .json()
+            .map_err(|error| format!("Could not parse Supabase response JSON: {}", error))?;
+
+        if !existing_rows.is_empty() {
+            continue;
+        }
+
+        let insert_response = client
+            .post(format!("{}/rest/v1/data_sharing", supabase_url))
+            .header("apikey", supabase_key.as_str())
+            .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+            .header(CONTENT_TYPE, "application/json")
+            .header("Prefer", "return=minimal")
+            .json(&serde_json::json!([
+                {
+                    "share_code": candidate,
+                    "match_data": [],
+                    "qual_data": [],
+                    "pit_data": []
+                }
+            ]))
+            .send()
+            .map_err(|error| format!("Supabase request failed: {}", error))?;
+
+        if insert_response.status().is_success() {
+            return Ok(candidate);
+        }
+
+        let status = insert_response.status();
+        let details = insert_response.text().unwrap_or_default();
+        let lowered = details.to_lowercase();
+
+        if status.as_u16() == 409 || lowered.contains("duplicate") || lowered.contains("unique") {
+            continue;
+        }
+
+        return Err(format!(
+            "Supabase returned HTTP {} while creating share code. {}",
+            status.as_u16(),
+            details
+        ));
+    }
+
+    Err("Could not create a unique share code after multiple attempts. Please try again.".into())
+}
+
+#[tauri::command]
+fn upload_project_share_data(project_id: String, share_code: String) -> Result<DataShareSyncResult, String> {
+    let project_id_trimmed = project_id.trim();
+    if project_id_trimmed.is_empty() {
+        return Err("Project ID cannot be empty.".into());
+    }
+
+    resolve_project_folder(project_id_trimmed)?;
+
+    let normalized_code = normalize_share_code(&share_code)?;
+
+    let match_entries = ensure_json_array(
+        read_or_init_project_data_file(project_id_trimmed.to_string(), "data.json".into(), serde_json::json!([]))?,
+        "data.json",
+    )?;
+    let qual_entries = ensure_json_array(
+        read_or_init_project_data_file(project_id_trimmed.to_string(), "qual.json".into(), serde_json::json!([]))?,
+        "qual.json",
+    )?;
+    let pit_entries = ensure_json_array(
+        read_or_init_project_data_file(project_id_trimmed.to_string(), "pit.json".into(), serde_json::json!([]))?,
+        "pit.json",
+    )?;
+
+    let match_count = match_entries.len();
+    let qual_count = qual_entries.len();
+    let pit_count = pit_entries.len();
+
+    let (supabase_url, supabase_key) = get_supabase_credentials()?;
+    let request_url = format!(
+        "{}/rest/v1/data_sharing?share_code=eq.{}",
+        supabase_url, normalized_code
+    );
+
+    let response = Client::new()
+        .patch(request_url)
+        .header("apikey", supabase_key.as_str())
+        .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+        .header(CONTENT_TYPE, "application/json")
+        .header("Prefer", "return=representation")
+        .json(&serde_json::json!({
+            "match_data": match_entries,
+            "qual_data": qual_entries,
+            "pit_data": pit_entries
+        }))
+        .send()
+        .map_err(|error| format!("Supabase request failed: {}", error))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let details = response.text().unwrap_or_default();
+        return Err(format!(
+            "Supabase returned HTTP {} while uploading shared data. {}",
+            status, details
+        ));
+    }
+
+    let rows: Vec<serde_json::Value> = response
+        .json()
+        .map_err(|error| format!("Could not parse Supabase response JSON: {}", error))?;
+
+    if rows.is_empty() {
+        return Err(format!(
+            "Share code '{}' was not found. Enter a valid code or create one first.",
+            normalized_code
+        ));
+    }
+
+    Ok(DataShareSyncResult {
+        share_code: normalized_code,
+        match_count,
+        qual_count,
+        pit_count,
+    })
+}
+
+#[tauri::command]
+fn download_project_share_data(project_id: String, share_code: String) -> Result<DataShareSyncResult, String> {
+    let project_id_trimmed = project_id.trim();
+    if project_id_trimmed.is_empty() {
+        return Err("Project ID cannot be empty.".into());
+    }
+
+    resolve_project_folder(project_id_trimmed)?;
+
+    let normalized_code = normalize_share_code(&share_code)?;
+    let (supabase_url, supabase_key) = get_supabase_credentials()?;
+    let request_url = build_data_sharing_query_url(&supabase_url, &normalized_code, "match_data,qual_data,pit_data");
+
+    let response = Client::new()
+        .get(request_url)
+        .header("apikey", supabase_key.as_str())
+        .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+        .header(CONTENT_TYPE, "application/json")
+        .send()
+        .map_err(|error| format!("Supabase request failed: {}", error))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let details = response.text().unwrap_or_default();
+        return Err(format!(
+            "Supabase returned HTTP {} while downloading shared data. {}",
+            status, details
+        ));
+    }
+
+    let rows: Vec<serde_json::Value> = response
+        .json()
+        .map_err(|error| format!("Could not parse Supabase response JSON: {}", error))?;
+
+    let Some(row) = rows.first() else {
+        return Err(format!(
+            "Share code '{}' was not found. Enter a valid code first.",
+            normalized_code
+        ));
+    };
+
+    let match_entries = ensure_json_array(
+        row.get("match_data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        "match_data",
+    )?;
+    let qual_entries = ensure_json_array(
+        row.get("qual_data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        "qual_data",
+    )?;
+    let pit_entries = ensure_json_array(
+        row.get("pit_data")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        "pit_data",
+    )?;
+
+    let match_count = match_entries.len();
+    let qual_count = qual_entries.len();
+    let pit_count = pit_entries.len();
+
+    write_project_data_file(
+        project_id_trimmed.to_string(),
+        "data.json".into(),
+        serde_json::Value::Array(match_entries),
+    )?;
+    write_project_data_file(
+        project_id_trimmed.to_string(),
+        "qual.json".into(),
+        serde_json::Value::Array(qual_entries),
+    )?;
+    write_project_data_file(
+        project_id_trimmed.to_string(),
+        "pit.json".into(),
+        serde_json::Value::Array(pit_entries),
+    )?;
+
+    Ok(DataShareSyncResult {
+        share_code: normalized_code,
+        match_count,
+        qual_count,
+        pit_count,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1221,6 +1544,10 @@ pub fn run() {
             write_json_file,
             append_json_entry,
             append_project_scan_entries,
+            validate_data_share_code,
+            create_data_share_code,
+            upload_project_share_data,
+            download_project_share_data,
             get_goonhq_workspace_overview,
             get_workspace_settings,
             set_workspace_root,

@@ -1,7 +1,7 @@
 import * as React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { BarChart3, FileJson, Folder, Home, Plus, Search, Settings, Upload } from "lucide-react";
+import { BarChart3, Download, FileJson, Folder, Home, Plus, Search, Settings, Upload } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Cell, LabelList, Legend, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { Button } from "@/components/ui/button";
@@ -36,10 +36,18 @@ type ContentHashValidationResult = {
   background_location?: string | null;
 };
 
+type DataShareSyncResult = {
+  share_code: string;
+  match_count: number;
+  qual_count: number;
+  pit_count: number;
+};
+
 type ProjectConfig = {
   matchContentHash: string;
   qualitativeContentHash: string;
   pitContentHash: string;
+  dataShareCode?: string;
   tagPointValues?: Record<string, number>;
   backgroundImage?: string | null;
   backgroundLocation?: string | null;
@@ -343,6 +351,7 @@ function App() {
     matchContentHash: "",
     qualitativeContentHash: "",
     pitContentHash: "",
+    dataShareCode: "",
     tagPointValues: {},
     backgroundImage: null,
     backgroundLocation: null,
@@ -351,9 +360,15 @@ function App() {
   const [configMatchHashDraft, setConfigMatchHashDraft] = React.useState("");
   const [configQualitativeHashDraft, setConfigQualitativeHashDraft] = React.useState("");
   const [configPitHashDraft, setConfigPitHashDraft] = React.useState("");
+  const [configShareCodeDraft, setConfigShareCodeDraft] = React.useState("");
   const [configStatus, setConfigStatus] = React.useState("");
   const [isSavingConfig, setIsSavingConfig] = React.useState(false);
+  const [isSavingShareCode, setIsSavingShareCode] = React.useState(false);
+  const [isCreatingShareCode, setIsCreatingShareCode] = React.useState(false);
+  const [isUploadingShareData, setIsUploadingShareData] = React.useState(false);
+  const [isDownloadingShareData, setIsDownloadingShareData] = React.useState(false);
   const [decodeFieldMapping, setDecodeFieldMapping] = React.useState<ScoutingFieldMapping | null>(null);
+  const [projectDataSyncNonce, setProjectDataSyncNonce] = React.useState(0);
 
   const [projectSection, setProjectSection] = React.useState<ProjectSection>("overview");
   const [teamSearch, setTeamSearch] = React.useState("");
@@ -564,7 +579,7 @@ function App() {
     return () => {
       isCancelled = true;
     };
-  }, [decodeFieldMapping, projectSection, route.kind, selectedProject?.json_file_path]);
+  }, [decodeFieldMapping, projectDataSyncNonce, projectSection, route.kind, selectedProject?.json_file_path]);
 
   React.useEffect(() => {
     if ((route.kind !== "project" && route.kind !== "team" && route.kind !== "match") || !selectedProject) {
@@ -584,6 +599,7 @@ function App() {
             matchContentHash: String(loaded.matchContentHash ?? ""),
             qualitativeContentHash: String(loaded.qualitativeContentHash ?? ""),
             pitContentHash: String(loaded.pitContentHash ?? ""),
+            dataShareCode: String(loaded.dataShareCode ?? ""),
             tagPointValues:
               loaded.tagPointValues && typeof loaded.tagPointValues === "object" && !Array.isArray(loaded.tagPointValues)
                 ? (loaded.tagPointValues as Record<string, number>)
@@ -601,6 +617,7 @@ function App() {
             matchContentHash: "",
             qualitativeContentHash: "",
             pitContentHash: "",
+            dataShareCode: "",
             tagPointValues: {},
             backgroundImage: null,
             backgroundLocation: null,
@@ -622,7 +639,8 @@ function App() {
     setConfigMatchHashDraft(projectConfig.matchContentHash ?? "");
     setConfigQualitativeHashDraft(projectConfig.qualitativeContentHash ?? "");
     setConfigPitHashDraft(projectConfig.pitContentHash ?? "");
-  }, [projectConfig.matchContentHash, projectConfig.pitContentHash, projectConfig.qualitativeContentHash]);
+    setConfigShareCodeDraft(projectConfig.dataShareCode ?? "");
+  }, [projectConfig.dataShareCode, projectConfig.matchContentHash, projectConfig.pitContentHash, projectConfig.qualitativeContentHash]);
 
   React.useEffect(() => {
     if ((route.kind !== "project" && route.kind !== "team" && route.kind !== "match") || !selectedProject) {
@@ -887,7 +905,7 @@ function App() {
     return () => {
       isCancelled = true;
     };
-  }, [projectConfig.pitContentHash, projectConfig.qualitativeContentHash, selectedProject]);
+  }, [projectConfig.pitContentHash, projectConfig.qualitativeContentHash, projectDataSyncNonce, selectedProject]);
 
   const filteredTeamNumbers = React.useMemo(() => {
     const term = teamSearch.trim().toLowerCase();
@@ -2463,6 +2481,7 @@ function App() {
         matchContentHash: contentHash,
         qualitativeContentHash: "",
         pitContentHash: "",
+        dataShareCode: "",
         tagPointValues: {},
         backgroundImage: validation.background_image ?? null,
         backgroundLocation: validation.background_location ?? null,
@@ -2600,6 +2619,170 @@ function App() {
       setIsSavingTagPoints(false);
     }
   }, [projectConfig, selectedProject]);
+
+  const normalizeShareCodeInput = React.useCallback((value: string) => value.replace(/\D/g, "").slice(0, 6), []);
+
+  const saveShareCodeToProjectConfig = React.useCallback(
+    async (rawCode: string, validateRemote: boolean) => {
+      if (!selectedProject) {
+        return null;
+      }
+
+      const normalizedCode = normalizeShareCodeInput(rawCode);
+      if (normalizedCode.length !== 6) {
+        setConfigStatus("Share code must be exactly 6 digits.");
+        return null;
+      }
+
+      if (validateRemote) {
+        const exists = await invoke<boolean>("validate_data_share_code", {
+          shareCode: normalizedCode,
+        });
+
+        if (!exists) {
+          setConfigStatus("Share code not found in backend. Double-check the code.");
+          return null;
+        }
+      }
+
+      const nextConfig: ProjectConfig = {
+        ...projectConfig,
+        dataShareCode: normalizedCode,
+      };
+
+      await invoke("save_project_config", {
+        projectId: selectedProject.id,
+        config: nextConfig,
+      });
+
+      setProjectConfig(nextConfig);
+      setConfigShareCodeDraft(normalizedCode);
+
+      return normalizedCode;
+    },
+    [normalizeShareCodeInput, projectConfig, selectedProject],
+  );
+
+  const handleSaveShareCode = React.useCallback(async () => {
+    if (!selectedProject || isSavingShareCode) {
+      return;
+    }
+
+    setIsSavingShareCode(true);
+
+    try {
+      const savedCode = await saveShareCodeToProjectConfig(configShareCodeDraft, true);
+      if (savedCode) {
+        setConfigStatus(`Share code ${savedCode} saved for this project.`);
+      }
+    } catch (error) {
+      setConfigStatus(`Unable to save share code: ${String(error)}`);
+    } finally {
+      setIsSavingShareCode(false);
+    }
+  }, [configShareCodeDraft, isSavingShareCode, saveShareCodeToProjectConfig, selectedProject]);
+
+  const handleCreateShareCode = React.useCallback(async () => {
+    if (!selectedProject || isCreatingShareCode) {
+      return;
+    }
+
+    setIsCreatingShareCode(true);
+
+    try {
+      const createdCode = await invoke<string>("create_data_share_code", {
+        projectId: selectedProject.id,
+      });
+
+      const savedCode = await saveShareCodeToProjectConfig(createdCode, false);
+      if (savedCode) {
+        setConfigStatus(`Created and saved share code ${savedCode}.`);
+      }
+    } catch (error) {
+      setConfigStatus(`Unable to create share code: ${String(error)}`);
+    } finally {
+      setIsCreatingShareCode(false);
+    }
+  }, [isCreatingShareCode, saveShareCodeToProjectConfig, selectedProject]);
+
+  const handleUploadSharedData = React.useCallback(async () => {
+    if (!selectedProject || isUploadingShareData) {
+      return;
+    }
+
+    setIsUploadingShareData(true);
+
+    try {
+      const existingCode = normalizeShareCodeInput(projectConfig.dataShareCode ?? "");
+      const draftCode = normalizeShareCodeInput(configShareCodeDraft);
+      const candidateCode = existingCode.length === 6 ? existingCode : draftCode;
+
+      if (candidateCode.length !== 6) {
+        setConfigStatus("Enter and save a 6-digit share code before uploading.");
+        return;
+      }
+
+      if (existingCode !== candidateCode) {
+        const persistedCode = await saveShareCodeToProjectConfig(candidateCode, true);
+        if (!persistedCode) {
+          return;
+        }
+      }
+
+      const result = await invoke<DataShareSyncResult>("upload_project_share_data", {
+        projectId: selectedProject.id,
+        shareCode: candidateCode,
+      });
+
+      setConfigStatus(
+        `Uploaded to ${result.share_code}: match ${result.match_count}, qual ${result.qual_count}, pit ${result.pit_count}.`,
+      );
+    } catch (error) {
+      setConfigStatus(`Unable to upload shared data: ${String(error)}`);
+    } finally {
+      setIsUploadingShareData(false);
+    }
+  }, [configShareCodeDraft, isUploadingShareData, normalizeShareCodeInput, projectConfig.dataShareCode, saveShareCodeToProjectConfig, selectedProject]);
+
+  const handleDownloadSharedData = React.useCallback(async () => {
+    if (!selectedProject || isDownloadingShareData) {
+      return;
+    }
+
+    setIsDownloadingShareData(true);
+
+    try {
+      const existingCode = normalizeShareCodeInput(projectConfig.dataShareCode ?? "");
+      const draftCode = normalizeShareCodeInput(configShareCodeDraft);
+      const candidateCode = existingCode.length === 6 ? existingCode : draftCode;
+
+      if (candidateCode.length !== 6) {
+        setConfigStatus("Enter and save a 6-digit share code before downloading.");
+        return;
+      }
+
+      if (existingCode !== candidateCode) {
+        const persistedCode = await saveShareCodeToProjectConfig(candidateCode, true);
+        if (!persistedCode) {
+          return;
+        }
+      }
+
+      const result = await invoke<DataShareSyncResult>("download_project_share_data", {
+        projectId: selectedProject.id,
+        shareCode: candidateCode,
+      });
+
+      setProjectDataSyncNonce((previous) => previous + 1);
+      setConfigStatus(
+        `Downloaded from ${result.share_code}: match ${result.match_count}, qual ${result.qual_count}, pit ${result.pit_count}.`,
+      );
+    } catch (error) {
+      setConfigStatus(`Unable to download shared data: ${String(error)}`);
+    } finally {
+      setIsDownloadingShareData(false);
+    }
+  }, [configShareCodeDraft, isDownloadingShareData, normalizeShareCodeInput, projectConfig.dataShareCode, saveShareCodeToProjectConfig, selectedProject]);
 
   const handleSetRootFolder = React.useCallback(async () => {
     if (isSettingRootFolder) {
@@ -3591,6 +3774,66 @@ function App() {
                     >
                       {isSavingConfig ? "Saving..." : "Validate + Save Pit"}
                     </Button>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                  <div className="mb-3">
+                    <p className="text-sm font-semibold text-white">Data Sharing</p>
+                    <p className="text-xs text-white/65">Create or save a 6-digit code, then upload/download match, qualitative, and pit data through Supabase.</p>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+                    <div>
+                      <p className="mb-2 text-sm font-semibold text-white">Share Code</p>
+                      <Input
+                        value={configShareCodeDraft}
+                        onChange={(event) => setConfigShareCodeDraft(event.currentTarget.value.replace(/\D/g, "").slice(0, 6))}
+                        placeholder="286324"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        className="h-10 border-white/10 bg-slate-900/80 text-white placeholder:text-white/35"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+                      <Button
+                        type="button"
+                        className="bg-blue-600 text-white hover:bg-blue-500"
+                        onClick={() => void handleCreateShareCode()}
+                        disabled={isCreatingShareCode || isSavingShareCode || isUploadingShareData || isDownloadingShareData}
+                      >
+                        {isCreatingShareCode ? "Creating..." : "Create Share Code"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="border-white/20 bg-slate-900/70 text-white hover:bg-slate-800"
+                        onClick={() => void handleSaveShareCode()}
+                        disabled={isCreatingShareCode || isSavingShareCode || isUploadingShareData || isDownloadingShareData}
+                      >
+                        {isSavingShareCode ? "Saving..." : "Save Code"}
+                      </Button>
+                      <Button
+                        type="button"
+                        className="bg-blue-600 text-white hover:bg-blue-500"
+                        onClick={() => void handleUploadSharedData()}
+                        disabled={isCreatingShareCode || isSavingShareCode || isUploadingShareData || isDownloadingShareData}
+                      >
+                        <Upload className="mr-2 h-4 w-4" />
+                        {isUploadingShareData ? "Uploading..." : "Upload"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="border-white/20 bg-slate-900/70 text-white hover:bg-slate-800"
+                        onClick={() => void handleDownloadSharedData()}
+                        disabled={isCreatingShareCode || isSavingShareCode || isUploadingShareData || isDownloadingShareData}
+                      >
+                        <Download className="mr-2 h-4 w-4" />
+                        {isDownloadingShareData ? "Downloading..." : "Download"}
+                      </Button>
+                    </div>
                   </div>
                 </div>
 

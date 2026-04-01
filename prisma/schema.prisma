@@ -89,3 +89,16 @@ model FieldConfig {
   @@unique([uploadId])
   @@map("field_configs")
 }
+
+model DataSharing {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  shareCode String   @unique @db.VarChar(6) @map("share_code")
+  matchData Json     @map("match_data")
+  qualData  Json     @map("qual_data")
+  pitData   Json     @map("pit_data")
+
+  @@index([updatedAt(sort: Desc)])
+  @@map("data_sharing")
+}
