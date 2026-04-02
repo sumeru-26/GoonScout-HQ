@@ -125,6 +125,32 @@ function normalizeTbaTeamKey(value: unknown): string {
 	return text;
 }
 
+function parseSlotTeamsFromEntryTeamField(value: unknown): Map<SlotCode, string> {
+	const output = new Map<SlotCode, string>();
+	const raw = toTrimmedString(value);
+	if (!raw.includes(",")) {
+		return output;
+	}
+
+	const parts = raw
+		.split(",")
+		.map((part) => normalizeTbaTeamKey(part))
+		.filter((part) => part.length > 0);
+
+	if (parts.length < SLOT_ORDER.length) {
+		return output;
+	}
+
+	for (let index = 0; index < SLOT_ORDER.length; index += 1) {
+		const team = parts[index] ?? "";
+		if (team) {
+			output.set(SLOT_ORDER[index], team);
+		}
+	}
+
+	return output;
+}
+
 function extractAllianceTeamBySlot(matchResponse: unknown): Map<SlotCode, string> {
 	const output = new Map<SlotCode, string>();
 	const matchObject = asObject(matchResponse);
@@ -241,12 +267,16 @@ export async function decodeQualitativeScoutingEntry(
 		generalNotes.push({ field: parsedLabel.field || fieldLabel, note: value });
 	}
 
-	const resolved = await resolveQualitativeSlotTeams(entry, fetchMatchByKey);
+	const directSlotTeams = parseSlotTeamsFromEntryTeamField(entry.team);
+	const hasDirectSlotTeams = SLOT_ORDER.some((slot) => {
+		const team = directSlotTeams.get(slot) ?? "";
+		return team.length > 0;
+	});
+
+	const resolved = hasDirectSlotTeams ? { slotTeams: new Map<SlotCode, string>(), matchKey: null, eventKey: null } : await resolveQualitativeSlotTeams(entry, fetchMatchByKey);
 	const matchNumber = toNumber(entry.match, 0);
 	const scouter = toTrimmedString(entry.scouter) || "Unknown";
-	const sourceTeam = toTrimmedString(entry.team);
-	const scanEventKey = toTrimmedString(entry.eventKey) || toTrimmedString(entry.event_key) || toTrimmedString(entry.event);
-	const eventKey = resolved.eventKey ?? (scanEventKey || null);
+	const sourceTeam = hasDirectSlotTeams ? "" : toTrimmedString(entry.team);
 
 	const output: JsonObject[] = [];
 
@@ -256,22 +286,18 @@ export async function decodeQualitativeScoutingEntry(
 			continue;
 		}
 
+		const directTeam = directSlotTeams.get(slot) ?? "";
 		const resolvedTeam = resolved.slotTeams.get(slot) ?? "";
 		const fallbackTeam = sourceTeam || slot;
-		const team = resolvedTeam || fallbackTeam;
+		const team = directTeam || resolvedTeam || fallbackTeam;
 		const alliance = slot.startsWith("b") ? "blue" : "red";
 
 		output.push({
-			scoutType: "qualitative",
-			ft: [1],
 			match: matchNumber,
 			team,
 			scouter,
 			slot,
 			alliance,
-			sourceTeam,
-			eventKey,
-			matchKey: resolved.matchKey,
 			notes,
 			generalNotes,
 		});
@@ -283,16 +309,11 @@ export async function decodeQualitativeScoutingEntry(
 
 	return [
 		{
-			scoutType: "qualitative",
-			ft: [1],
 			match: matchNumber,
-			team: sourceTeam || "unknown",
+			team: directSlotTeams.get("b1") || sourceTeam || "unknown",
 			scouter,
 			slot: "unknown",
 			alliance: "unknown",
-			sourceTeam,
-			eventKey,
-			matchKey: resolved.matchKey,
 			notes: [],
 			generalNotes,
 		},
@@ -359,53 +380,6 @@ function unescapePitText(value: string): string {
 	return output;
 }
 
-function questionLabel(question: JsonObject | null, questionNumber: number): string {
-	if (!question) {
-		return `Question ${questionNumber}`;
-	}
-
-	const candidates = [question.label, question.question, question.title, question.name, question.prompt];
-	for (const candidate of candidates) {
-		const text = toTrimmedString(candidate);
-		if (text) {
-			return text;
-		}
-	}
-
-	return `Question ${questionNumber}`;
-}
-
-function getQuestionOptions(question: JsonObject | null): string[] {
-	if (!question || !Array.isArray(question.options)) {
-		return [];
-	}
-
-	return question.options
-		.map((option) => {
-			if (typeof option === "string") {
-				return option;
-			}
-
-			const optionObject = asObject(option);
-			if (!optionObject) {
-				return "";
-			}
-
-			return toTrimmedString(optionObject.label) || toTrimmedString(optionObject.value) || toTrimmedString(optionObject.text);
-		})
-		.filter((option) => option.length > 0);
-}
-
-function toQuestionArray(payload: unknown): JsonObject[] {
-	const payloadObject = asObject(payload);
-	const editorState = payloadObject ? asObject(payloadObject.editorState) : null;
-	if (!editorState || !Array.isArray(editorState.postMatchQuestions)) {
-		return [];
-	}
-
-	return editorState.postMatchQuestions.map((question) => asObject(question)).filter((question): question is JsonObject => question !== null);
-}
-
 function parsePitToken(token: string): { type: "text" | "slider" | "multi" | "single"; value: unknown } | null {
 	const tokenType = token.slice(0, 2);
 	const tokenValue = token.slice(2);
@@ -435,17 +409,9 @@ function parsePitToken(token: string): { type: "text" | "slider" | "multi" | "si
 	return null;
 }
 
-export function decodePitScoutingEntry(entry: JsonObject, pitPayload: unknown): JsonObject {
+export function decodePitScoutingEntry(entry: JsonObject, _pitPayload: unknown): JsonObject {
 	const pq = typeof entry.pq === "string" ? entry.pq : "";
-	const questions = toQuestionArray(pitPayload);
 	const answersByQuestion: Record<string, unknown> = {};
-	const answers: Array<{
-		questionNumber: number;
-		question: string;
-		answerType: "text" | "slider" | "multi" | "single";
-		answer: unknown;
-		answerLabel: string;
-	}> = [];
 
 	for (const record of splitUnescaped(pq, ";").filter((item) => item.length > 0)) {
 		const [questionPart, ...rest] = splitUnescaped(record, "=");
@@ -461,44 +427,12 @@ export function decodePitScoutingEntry(entry: JsonObject, pitPayload: unknown): 
 			continue;
 		}
 
-		const question = questions[questionNumber - 1] ?? null;
-		const label = questionLabel(question, questionNumber);
-		const options = getQuestionOptions(question);
-
-		let answerLabel = "";
-		if (parsedToken.type === "text") {
-			answerLabel = String(parsedToken.value ?? "");
-		} else if (parsedToken.type === "slider") {
-			answerLabel = String(parsedToken.value ?? 0);
-		} else if (parsedToken.type === "multi") {
-			const indexes = Array.isArray(parsedToken.value) ? (parsedToken.value as number[]) : [];
-			answerLabel = indexes
-				.map((index) => options[index] ?? String(index))
-				.filter((value) => value.length > 0)
-				.join(", ");
-		} else if (parsedToken.type === "single") {
-			const index = toNumber(parsedToken.value, -1);
-			answerLabel = index >= 0 ? options[index] ?? String(index) : "None";
-		}
-
 		answersByQuestion[String(questionNumber)] = parsedToken.value;
-		answers.push({
-			questionNumber,
-			question: label,
-			answerType: parsedToken.type,
-			answer: parsedToken.value,
-			answerLabel,
-		});
 	}
 
 	return {
-		scoutType: "pit",
-		ft: [2],
-		pqv: toNumber(entry.pqv, 1),
 		team: toTrimmedString(entry.team),
-		match: toNumber(entry.match, 0),
 		scouter: toTrimmedString(entry.scouter) || "Unknown",
 		answersByQuestion,
-		answers,
 	};
 }

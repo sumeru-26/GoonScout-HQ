@@ -34,6 +34,7 @@ type JsonViewerPageProps = {
   fieldMapping?: ScoutingFieldMapping | null;
   qualitativeContentHash?: string;
   pitContentHash?: string;
+  onProjectDataChanged?: () => void;
 };
 
 type ContentHashValidationResult = {
@@ -192,6 +193,7 @@ function JsonViewerPage({
   fieldMapping,
   qualitativeContentHash = "",
   pitContentHash = "",
+  onProjectDataChanged,
 }: JsonViewerPageProps) {
   const [path, setPath] = useState(initialPath);
   const [jsonContent, setJsonContent] = useState("");
@@ -331,6 +333,10 @@ function JsonViewerPage({
 
     setJsonData(nextData);
     setJsonContent(prettyJson);
+
+    if (projectId) {
+      onProjectDataChanged?.();
+    }
   }
 
   async function commitEdit() {
@@ -659,6 +665,7 @@ function JsonViewerPage({
 
         setPath(projectJsonPath);
         await loadJsonFromPath(projectJsonPath);
+        onProjectDataChanged?.();
         setStatus("JSON uploaded, normalized, and replaced successfully.");
       } catch (error) {
         setStatus(`Unable to upload JSON: ${String(error)}`);
@@ -722,6 +729,8 @@ function JsonViewerPage({
             entries: [rawEntry],
           });
 
+          onProjectDataChanged?.();
+
           if (trimmedPath) {
             await loadJsonFromPath(trimmedPath);
           }
@@ -778,6 +787,8 @@ function JsonViewerPage({
           entries: decodedEntries,
         });
 
+        onProjectDataChanged?.();
+
         setStatus(`Qualitative QR decoded and saved to qual.json (${decodedEntries.length} team entries).`);
         return;
       }
@@ -802,6 +813,8 @@ function JsonViewerPage({
         scoutType: "pit",
         entries: [decodedPitEntry],
       });
+
+      onProjectDataChanged?.();
 
       setStatus("Pit QR decoded and saved to pit.json.");
       return;

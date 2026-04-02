@@ -1,7 +1,7 @@
 import * as React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { BarChart3, Download, FileJson, Folder, Home, Plus, Search, Settings, Upload } from "lucide-react";
+import { BarChart3, Download, FileJson, Folder, Home, Plus, RefreshCw, Search, Settings, Upload } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Cell, LabelList, Legend, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
 
 import { Button } from "@/components/ui/button";
@@ -53,6 +53,7 @@ type ProjectConfig = {
   backgroundLocation?: string | null;
   fieldMapping?: unknown;
   layoutPayload?: unknown;
+  pitLayoutPayload?: unknown;
   updatedAt?: number;
 };
 
@@ -97,6 +98,19 @@ type DataTagVariantGroup = {
   key: DataMetricVariant;
   label: string;
   tagsByPhase: Partial<Record<"auto" | "teleop", string>>;
+};
+
+type PitQuestionType = "text" | "slider" | "multi" | "single";
+
+type PitQuestionDefinition = {
+  questionNumber: number;
+  label: string;
+  type: PitQuestionType;
+  options: string[];
+  sliderMin: number;
+  sliderMax: number;
+  sliderLeftText: string;
+  sliderRightText: string;
 };
 
 type AllianceSide = "red" | "blue";
@@ -325,6 +339,258 @@ function parseLayoutPayload(value: unknown): unknown {
   return null;
 }
 
+function extractScoutTypeFromLayoutPayload(value: unknown): "match" | "qualitative" | "pit" | null {
+  const payload = parseLayoutPayload(value);
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+
+  const payloadRecord = payload as Record<string, unknown>;
+  const directScoutType = typeof payloadRecord.scoutType === "string" ? payloadRecord.scoutType.trim().toLowerCase() : "";
+  if (directScoutType === "match" || directScoutType === "qualitative" || directScoutType === "pit") {
+    return directScoutType;
+  }
+
+  const editorState = payloadRecord.editorState;
+  if (!editorState || typeof editorState !== "object" || Array.isArray(editorState)) {
+    return null;
+  }
+
+  const editorScoutType =
+    typeof (editorState as Record<string, unknown>).scoutType === "string"
+      ? ((editorState as Record<string, unknown>).scoutType as string).trim().toLowerCase()
+      : "";
+  if (editorScoutType === "match" || editorScoutType === "qualitative" || editorScoutType === "pit") {
+    return editorScoutType;
+  }
+
+  return null;
+}
+
+function extractMatchQualitativeTextFields(entry: JsonEntry): Array<{ field: string; note: string }> {
+  const ignoredKeys = new Set([
+    "team",
+    "match",
+    "scouter",
+    "scouters",
+    "ft",
+    "p",
+    "slot",
+    "alliance",
+    "event",
+    "eventKey",
+    "event_key",
+    "matchKey",
+    "match_key",
+    "key",
+  ]);
+
+  return Object.entries(entry)
+    .filter(([key, value]) => {
+      if (ignoredKeys.has(key)) {
+        return false;
+      }
+
+      return typeof value === "string" && value.trim().length > 0;
+    })
+    .map(([field, value]) => ({
+      field,
+      note: (value as string).trim(),
+    }));
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function extractQuestionLabel(source: Record<string, unknown>, fallback: string): string {
+  const candidates = [source.text, source.label, source.question, source.title, source.name, source.prompt];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return fallback;
+}
+
+function normalizePitQuestionType(value: unknown): PitQuestionType {
+  if (typeof value !== "string") {
+    return "text";
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return "text";
+  }
+
+  if (
+    normalized.includes("multi") ||
+    normalized.includes("checkbox") ||
+    normalized.includes("all-that-apply") ||
+    normalized.includes("multi-select")
+  ) {
+    return "multi";
+  }
+
+  if (normalized.includes("single") || normalized.includes("dropdown") || normalized.includes("select") || normalized.includes("radio")) {
+    return "single";
+  }
+
+  if (normalized.includes("slider") || normalized.includes("range") || normalized.includes("number")) {
+    return "slider";
+  }
+
+  return "text";
+}
+
+function extractQuestionOptions(source: Record<string, unknown>): string[] {
+  if (!Array.isArray(source.options)) {
+    return [];
+  }
+
+  return source.options
+    .map((option) => {
+      if (typeof option === "string") {
+        return option.trim();
+      }
+
+      const optionRecord = asRecord(option);
+      if (!optionRecord) {
+        return "";
+      }
+
+      const candidates = [optionRecord.label, optionRecord.value, optionRecord.text, optionRecord.name];
+      for (const candidate of candidates) {
+        if (typeof candidate === "string" && candidate.trim().length > 0) {
+          return candidate.trim();
+        }
+      }
+
+      if (typeof optionRecord.value === "number" && Number.isFinite(optionRecord.value)) {
+        return String(optionRecord.value);
+      }
+
+      return "";
+    })
+    .filter((option) => option.length > 0);
+}
+
+function extractPitQuestionDefinitions(payload: unknown): Map<number, PitQuestionDefinition> {
+  const definitions = new Map<number, PitQuestionDefinition>();
+  const parsedPayload = parseLayoutPayload(payload);
+  const payloadRecord = asRecord(parsedPayload);
+  if (!payloadRecord) {
+    return definitions;
+  }
+
+  const editorState = asRecord(payloadRecord.editorState);
+  const candidateLists: unknown[] = [
+    editorState?.pitQuestions,
+    editorState?.postMatchQuestions,
+    payloadRecord.pitQuestions,
+    payloadRecord.postMatchQuestions,
+    payloadRecord.questions,
+  ];
+
+  const questions = candidateLists.find((candidate) => Array.isArray(candidate));
+  if (!Array.isArray(questions)) {
+    return definitions;
+  }
+
+  questions.forEach((question, index) => {
+    const questionRecord = asRecord(question);
+    if (!questionRecord) {
+      return;
+    }
+
+    const fallbackNumber = index + 1;
+    const rawNumber = questionRecord.questionNumber;
+    const parsedNumber =
+      typeof rawNumber === "number" && Number.isInteger(rawNumber) && rawNumber > 0
+        ? rawNumber
+        : typeof rawNumber === "string" && /^\d+$/.test(rawNumber.trim())
+          ? Number(rawNumber.trim())
+          : fallbackNumber;
+
+    const rawSliderMin = questionRecord.sliderMin;
+    const rawSliderMax = questionRecord.sliderMax;
+    const sliderMin =
+      typeof rawSliderMin === "number" && Number.isFinite(rawSliderMin)
+        ? rawSliderMin
+        : typeof rawSliderMin === "string" && rawSliderMin.trim().length > 0 && Number.isFinite(Number(rawSliderMin))
+          ? Number(rawSliderMin)
+          : 0;
+    const sliderMax =
+      typeof rawSliderMax === "number" && Number.isFinite(rawSliderMax)
+        ? rawSliderMax
+        : typeof rawSliderMax === "string" && rawSliderMax.trim().length > 0 && Number.isFinite(Number(rawSliderMax))
+          ? Number(rawSliderMax)
+          : 10;
+
+    definitions.set(parsedNumber, {
+      questionNumber: parsedNumber,
+      label: extractQuestionLabel(questionRecord, `Question ${parsedNumber}`),
+      type: normalizePitQuestionType(questionRecord.type ?? questionRecord.inputType ?? questionRecord.questionType ?? questionRecord.kind),
+      options: extractQuestionOptions(questionRecord),
+      sliderMin,
+      sliderMax,
+      sliderLeftText: typeof questionRecord.sliderLeftText === "string" ? questionRecord.sliderLeftText.trim() : "Low",
+      sliderRightText: typeof questionRecord.sliderRightText === "string" ? questionRecord.sliderRightText.trim() : "High",
+    });
+  });
+
+  return definitions;
+}
+
+function formatPitAnswerLabel(value: unknown, definition: PitQuestionDefinition | null): string {
+  if (value === null || value === undefined) {
+    return "None";
+  }
+
+  const type = definition?.type ?? "text";
+  const options = definition?.options ?? [];
+
+  if (type === "multi") {
+    const selections = Array.isArray(value) ? value : [];
+    const labels = selections
+      .map((item) => {
+        const index = typeof item === "number" ? item : typeof item === "string" ? Number(item) : NaN;
+        if (Number.isInteger(index) && index >= 0) {
+          return options[index] ?? String(index);
+        }
+        return String(item);
+      })
+      .filter((item) => item.trim().length > 0);
+    return labels.length > 0 ? labels.join(", ") : "None";
+  }
+
+  if (type === "single") {
+    const index = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+    if (Number.isInteger(index) && index >= 0) {
+      return options[index] ?? String(index);
+    }
+    return typeof value === "string" && value.trim().length > 0 ? value : "None";
+  }
+
+  if (Array.isArray(value)) {
+    const labels = value.map((item) => String(item)).filter((item) => item.trim().length > 0);
+    return labels.length > 0 ? labels.join(", ") : "None";
+  }
+
+  if (typeof value === "string") {
+    return value.trim().length > 0 ? value : "None";
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  return JSON.stringify(value);
+}
+
 const cardGradient =
   "radial-gradient(circle at 20% 20%, rgba(59,130,246,0.16), transparent 42%), radial-gradient(circle at 80% 35%, rgba(30,64,175,0.25), transparent 45%), linear-gradient(180deg, rgba(15,23,42,0.9), rgba(10,15,32,0.95))";
 
@@ -356,6 +622,7 @@ function App() {
     backgroundImage: null,
     backgroundLocation: null,
     fieldMapping: null,
+    pitLayoutPayload: null,
   });
   const [configMatchHashDraft, setConfigMatchHashDraft] = React.useState("");
   const [configQualitativeHashDraft, setConfigQualitativeHashDraft] = React.useState("");
@@ -494,6 +761,7 @@ function App() {
     const needsIndexForProjectTabs = route.kind === "project" && (projectSection === "teams" || projectSection === "scouts" || projectSection === "data");
     const needsIndexForTeamPage = route.kind === "team";
     const needsIndexForMatchPage = route.kind === "match";
+    const needsMatchData = route.kind === "team" || route.kind === "match" || projectSection === "data";
 
     if (!needsIndexForProjectTabs && !needsIndexForTeamPage && !needsIndexForMatchPage) {
       return;
@@ -503,6 +771,7 @@ function App() {
       setJsonEntries([]);
       setTeamNumbers([]);
       setScoutNames([]);
+      setIndexError(needsMatchData ? "This project has no match data file configured." : "");
       return;
     }
 
@@ -510,7 +779,7 @@ function App() {
       setJsonEntries([]);
       setTeamNumbers([]);
       setScoutNames([]);
-      setIndexError("Missing field mapping. Validate the project match content hash in Config to decode compressed data.");
+      setIndexError(needsMatchData ? "Missing field mapping. Validate the project match content hash in Config to decode compressed data." : "");
       return;
     }
 
@@ -608,6 +877,7 @@ function App() {
             backgroundLocation: loaded.backgroundLocation ?? null,
             fieldMapping: loaded.fieldMapping ?? null,
             layoutPayload: loaded.layoutPayload ?? null,
+            pitLayoutPayload: loaded.pitLayoutPayload ?? null,
             updatedAt: loaded.updatedAt,
           });
         }
@@ -623,6 +893,7 @@ function App() {
             backgroundLocation: null,
             fieldMapping: null,
             layoutPayload: null,
+            pitLayoutPayload: null,
           });
         }
       }
@@ -654,13 +925,15 @@ function App() {
       const storedMapping = isScoutingFieldMapping(projectConfig.fieldMapping) ? projectConfig.fieldMapping : null;
       const hasStoredMapping = Boolean(storedMapping);
       const hasStoredLayoutPayload = Boolean(parseLayoutPayload(projectConfig.layoutPayload));
+      const storedLayoutScoutType = extractScoutTypeFromLayoutPayload(projectConfig.layoutPayload);
+      const storedLayoutIsMatch = !storedLayoutScoutType || storedLayoutScoutType === "match";
       const hasStoredBackgroundImage = Boolean(projectConfig.backgroundImage);
 
       if (hasStoredMapping && !isCancelled) {
         setDecodeFieldMapping(storedMapping);
       }
 
-      if (hasStoredMapping && hasStoredLayoutPayload && hasStoredBackgroundImage) {
+      if (hasStoredMapping && hasStoredLayoutPayload && hasStoredBackgroundImage && storedLayoutIsMatch) {
         return;
       }
 
@@ -907,23 +1180,79 @@ function App() {
     };
   }, [projectConfig.pitContentHash, projectConfig.qualitativeContentHash, projectDataSyncNonce, selectedProject]);
 
+  const mergedTeamNumbers = React.useMemo(() => {
+    const uniqueTeams = new Set<string>();
+
+    for (const team of teamNumbers) {
+      if (team.trim()) {
+        uniqueTeams.add(team.trim());
+      }
+    }
+
+    for (const entry of qualitativeEntries) {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+      if (team) {
+        uniqueTeams.add(team);
+      }
+    }
+
+    for (const entry of pitEntries) {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+      if (team) {
+        uniqueTeams.add(team);
+      }
+    }
+
+    return Array.from(uniqueTeams).sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  }, [pitEntries, qualitativeEntries, teamNumbers]);
+
+  const mergedScoutNames = React.useMemo(() => {
+    const uniqueScouts = new Set<string>();
+
+    for (const scout of scoutNames) {
+      if (scout.trim()) {
+        uniqueScouts.add(scout.trim());
+      }
+    }
+
+    for (const entry of qualitativeEntries) {
+      const scoutValue = entry.scouter;
+      const scout = typeof scoutValue === "string" ? scoutValue.trim() : "";
+      if (scout) {
+        uniqueScouts.add(scout);
+      }
+    }
+
+    for (const entry of pitEntries) {
+      const scoutValue = entry.scouter;
+      const scout = typeof scoutValue === "string" ? scoutValue.trim() : "";
+      if (scout) {
+        uniqueScouts.add(scout);
+      }
+    }
+
+    return Array.from(uniqueScouts).sort((left, right) => left.localeCompare(right));
+  }, [pitEntries, qualitativeEntries, scoutNames]);
+
   const filteredTeamNumbers = React.useMemo(() => {
     const term = teamSearch.trim().toLowerCase();
     if (!term) {
-      return teamNumbers;
+      return mergedTeamNumbers;
     }
 
-    return teamNumbers.filter((team) => team.toLowerCase().includes(term));
-  }, [teamNumbers, teamSearch]);
+    return mergedTeamNumbers.filter((team) => team.toLowerCase().includes(term));
+  }, [mergedTeamNumbers, teamSearch]);
 
   const filteredScoutNames = React.useMemo(() => {
     const term = scoutSearch.trim().toLowerCase();
     if (!term) {
-      return scoutNames;
+      return mergedScoutNames;
     }
 
-    return scoutNames.filter((scout) => scout.toLowerCase().includes(term));
-  }, [scoutNames, scoutSearch]);
+    return mergedScoutNames.filter((scout) => scout.toLowerCase().includes(term));
+  }, [mergedScoutNames, scoutSearch]);
 
   const activeTeam = route.kind === "team" ? route.team : "";
   const statsTeam = route.kind === "team" ? activeTeam : selectedTeam;
@@ -1496,6 +1825,32 @@ function App() {
     });
   }, [jsonEntries, statsTeam]);
 
+  const selectedStatsTeamHasSupplementalData = React.useMemo(() => {
+    if (!statsTeam) {
+      return false;
+    }
+
+    const hasQualitative = qualitativeEntries.some((entry) => {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+      return team === statsTeam;
+    });
+    if (hasQualitative) {
+      return true;
+    }
+
+    return pitEntries.some((entry) => {
+      const teamValue = entry.team;
+      const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
+      return team === statsTeam;
+    });
+  }, [pitEntries, qualitativeEntries, statsTeam]);
+
+  const showMissingMatchDataNotice = React.useMemo(() => {
+    const hasSupplementalData = qualitativeEntries.length > 0 || pitEntries.length > 0;
+    return jsonEntries.length === 0 && hasSupplementalData;
+  }, [jsonEntries.length, pitEntries.length, qualitativeEntries.length]);
+
   const selectedTeamAccuracyStats = React.useMemo(() => {
     const stats: Array<{ tag: string; successes: number; fails: number; accuracy: number }> = [];
 
@@ -1575,19 +1930,18 @@ function App() {
   }, [extractNumericValue, selectedTeamEntries]);
 
   const selectedTeamNotes = React.useMemo(() => {
-    const rows: Array<{ match: number; scoutType: string; scouter: string; good: string; bad: string; area: string }> = [];
+    const rows: Array<{ match: number; scoutType: string; scouter: string; notes: Array<{ field: string; note: string }> }> = [];
 
     for (const entry of selectedTeamEntries) {
       const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : 0;
       const scouter = typeof entry.scouter === "string" ? entry.scouter : "Unknown";
       const ft = Array.isArray(entry.ft) && typeof entry.ft[0] === "number" ? entry.ft[0] : 0;
+      const notes = extractMatchQualitativeTextFields(entry);
       rows.push({
         match: Number.isFinite(matchValue) ? matchValue : 0,
         scoutType: ft === 1 ? "qualitative" : ft === 2 ? "pit" : "match",
         scouter,
-        good: typeof entry.good === "string" ? entry.good : "",
-        bad: typeof entry.bad === "string" ? entry.bad : "",
-        area: typeof entry.area === "string" ? entry.area : "",
+        notes,
       });
     }
 
@@ -1600,7 +1954,7 @@ function App() {
       return selectedTeamNotes;
     }
 
-    return selectedTeamNotes.filter((row) => `${row.good} ${row.bad} ${row.area}`.toLowerCase().includes(term));
+    return selectedTeamNotes.filter((row) => row.notes.some((item) => `${item.field} ${item.note}`.toLowerCase().includes(term)));
   }, [selectedTeamNotes, teamNoteSearch]);
 
   const selectedTeamQualitativeRows = React.useMemo(() => {
@@ -1670,12 +2024,22 @@ function App() {
     });
   }, [selectedTeamQualitativeRows, teamQualitativeSearch]);
 
+  const pitQuestionDefinitions = React.useMemo(() => {
+    return extractPitQuestionDefinitions(projectConfig.pitLayoutPayload ?? projectConfig.layoutPayload);
+  }, [projectConfig.layoutPayload, projectConfig.pitLayoutPayload]);
+
   const selectedTeamPitRows = React.useMemo(() => {
     if (!activeTeam) {
       return [] as Array<{
-        match: number;
+        entryIndex: number;
         scouter: string;
-        answers: Array<{ questionNumber: number; question: string; answerLabel: string }>;
+        answers: Array<{
+          questionNumber: number;
+          question: string;
+          answerLabel: string;
+          answerValue: unknown;
+          definition: PitQuestionDefinition | null;
+        }>;
       }>;
     }
 
@@ -1685,27 +2049,37 @@ function App() {
         const team = typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "";
         return team === activeTeam;
       })
-      .map((entry) => {
-        const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : 0;
-        const answers = Array.isArray(entry.answers)
-          ? entry.answers
-              .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
-              .map((item) => ({
-                questionNumber: typeof item.questionNumber === "number" ? item.questionNumber : 0,
-                question: typeof item.question === "string" ? item.question : "Question",
-                answerLabel: typeof item.answerLabel === "string" ? item.answerLabel : JSON.stringify(item.answer ?? ""),
-              }))
-          : [];
+      .map((entry, index) => {
+        const answersSource = asRecord(entry.answersByQuestion) ?? {};
+        const answers = Object.entries(answersSource)
+          .map(([questionKey, value]) => {
+            const parsedNumber = /^\d+$/.test(questionKey.trim()) ? Number(questionKey.trim()) : 0;
+            const definition = pitQuestionDefinitions.get(parsedNumber) ?? null;
+
+            return {
+              questionNumber: parsedNumber,
+              question: definition?.label ?? `Question ${questionKey}`,
+              answerLabel: formatPitAnswerLabel(value, definition),
+              answerValue: value,
+              definition,
+            };
+          })
+          .sort((left, right) => {
+            if (left.questionNumber === right.questionNumber) {
+              return left.question.localeCompare(right.question);
+            }
+            return left.questionNumber - right.questionNumber;
+          });
 
         return {
-          match: Number.isFinite(matchValue) ? matchValue : 0,
+          entryIndex: index,
           scouter: typeof entry.scouter === "string" && entry.scouter.trim() ? entry.scouter : "Unknown",
           answers,
         };
       });
 
-    return rows.sort((left, right) => right.match - left.match);
-  }, [activeTeam, pitEntries]);
+    return rows.sort((left, right) => right.entryIndex - left.entryIndex);
+  }, [activeTeam, pitEntries, pitQuestionDefinitions]);
 
   const filteredSelectedTeamPitRows = React.useMemo(() => {
     const term = teamPitSearch.trim().toLowerCase();
@@ -1718,6 +2092,127 @@ function App() {
       return content.toLowerCase().includes(term);
     });
   }, [selectedTeamPitRows, teamPitSearch]);
+
+  const selectedScoutMatchRows = React.useMemo(() => {
+    const scout = selectedScout.trim().toLowerCase();
+    if (!scout) {
+      return [] as Array<{ team: string; match: number; notes: Array<{ field: string; note: string }> }>;
+    }
+
+    const rows = jsonEntries
+      .filter((entry) => {
+        const scouterValue = typeof entry.scouter === "string" ? entry.scouter.trim().toLowerCase() : "";
+        return scouterValue === scout;
+      })
+      .map((entry) => {
+        const teamValue = entry.team;
+        const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : 0;
+
+        return {
+          team: typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "Unknown",
+          match: Number.isFinite(matchValue) ? matchValue : 0,
+          notes: extractMatchQualitativeTextFields(entry),
+        };
+      });
+
+    return rows.sort((left, right) => {
+      if (left.match !== right.match) {
+        return right.match - left.match;
+      }
+      return left.team.localeCompare(right.team, undefined, { numeric: true });
+    });
+  }, [jsonEntries, selectedScout]);
+
+  const selectedScoutQualitativeRows = React.useMemo(() => {
+    const scout = selectedScout.trim().toLowerCase();
+    if (!scout) {
+      return [] as Array<{
+        team: string;
+        match: number;
+        slot: string;
+        alliance: string;
+        noteCount: number;
+        generalCount: number;
+      }>;
+    }
+
+    const rows = qualitativeEntries
+      .filter((entry) => {
+        const scouterValue = typeof entry.scouter === "string" ? entry.scouter.trim().toLowerCase() : "";
+        return scouterValue === scout;
+      })
+      .map((entry) => {
+        const teamValue = entry.team;
+        const matchValue = typeof entry.match === "number" ? entry.match : typeof entry.match === "string" ? Number(entry.match) : 0;
+        const notes = Array.isArray(entry.notes) ? entry.notes : [];
+        const generalNotes = Array.isArray(entry.generalNotes) ? entry.generalNotes : [];
+
+        return {
+          team: typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "Unknown",
+          match: Number.isFinite(matchValue) ? matchValue : 0,
+          slot: typeof entry.slot === "string" ? entry.slot : "",
+          alliance: typeof entry.alliance === "string" ? entry.alliance : "",
+          noteCount: notes.length,
+          generalCount: generalNotes.length,
+        };
+      });
+
+    return rows.sort((left, right) => {
+      if (left.match !== right.match) {
+        return right.match - left.match;
+      }
+      return left.team.localeCompare(right.team, undefined, { numeric: true });
+    });
+  }, [qualitativeEntries, selectedScout]);
+
+  const selectedScoutPitRows = React.useMemo(() => {
+    const scout = selectedScout.trim().toLowerCase();
+    if (!scout) {
+      return [] as Array<{
+        entryIndex: number;
+        team: string;
+        answerCount: number;
+        preview: string;
+      }>;
+    }
+
+    const rows = pitEntries.flatMap((entry, index) => {
+      const scouterValue = typeof entry.scouter === "string" ? entry.scouter.trim().toLowerCase() : "";
+      if (scouterValue !== scout) {
+        return [];
+      }
+
+      const teamValue = entry.team;
+      const answersSource = asRecord(entry.answersByQuestion) ?? {};
+      const answers = Object.entries(answersSource)
+        .map(([questionKey, value]) => {
+          const parsedNumber = /^\d+$/.test(questionKey.trim()) ? Number(questionKey.trim()) : 0;
+          const definition = pitQuestionDefinitions.get(parsedNumber) ?? null;
+          return {
+            questionNumber: parsedNumber,
+            question: definition?.label ?? `Question ${questionKey}`,
+            answerLabel: formatPitAnswerLabel(value, definition),
+          };
+        })
+        .sort((left, right) => left.questionNumber - right.questionNumber);
+
+      const preview = answers
+        .slice(0, 2)
+        .map((answer) => `${answer.question}: ${answer.answerLabel}`)
+        .join(" • ");
+
+      return [
+        {
+          entryIndex: index,
+          team: typeof teamValue === "string" ? teamValue.trim() : typeof teamValue === "number" ? String(teamValue) : "Unknown",
+          answerCount: answers.length,
+          preview,
+        },
+      ];
+    });
+
+    return rows.sort((left, right) => right.entryIndex - left.entryIndex);
+  }, [pitEntries, pitQuestionDefinitions, selectedScout]);
 
   const selectedTeamHasEventTracking = React.useMemo(() => {
     for (const entry of selectedTeamEntries) {
@@ -2429,6 +2924,15 @@ function App() {
     window.location.hash = buildMatchHash(projectId, team, match);
   }, []);
 
+  const refreshProjectDataViews = React.useCallback(() => {
+    setProjectDataSyncNonce((previous) => previous + 1);
+  }, []);
+
+  const handleTopNavRefresh = React.useCallback(() => {
+    void refreshWorkspace();
+    refreshProjectDataViews();
+  }, [refreshProjectDataViews, refreshWorkspace]);
+
   const openMatchFromDataTeam = React.useCallback(
     (team: string) => {
       if (!selectedProject?.id) {
@@ -2487,6 +2991,7 @@ function App() {
         backgroundLocation: validation.background_location ?? null,
         fieldMapping: validation.field_mapping ?? null,
         layoutPayload: validation.payload ?? null,
+        pitLayoutPayload: null,
       };
 
       await invoke("save_project_config", {
@@ -2537,6 +3042,7 @@ function App() {
         matchContentHash: kind === "match" ? hashValue : projectConfig.matchContentHash,
         qualitativeContentHash: kind === "qualitative" ? hashValue : projectConfig.qualitativeContentHash,
         pitContentHash: kind === "pit" ? hashValue : projectConfig.pitContentHash,
+        pitLayoutPayload: kind === "pit" && hashValue.length === 0 ? null : (projectConfig.pitLayoutPayload ?? null),
       };
 
       setIsSavingConfig(true);
@@ -2553,13 +3059,21 @@ function App() {
             return;
           }
 
-          const nextConfig: ProjectConfig = {
-            ...nextConfigWithDraftHash,
-            backgroundImage: validation.background_image ?? projectConfig.backgroundImage ?? null,
-            backgroundLocation: validation.background_location ?? projectConfig.backgroundLocation ?? null,
-            fieldMapping: validation.field_mapping ?? projectConfig.fieldMapping ?? null,
-            layoutPayload: validation.payload ?? projectConfig.layoutPayload ?? null,
-          };
+          const nextConfig: ProjectConfig =
+            kind === "match"
+              ? {
+                  ...nextConfigWithDraftHash,
+                  backgroundImage: validation.background_image ?? projectConfig.backgroundImage ?? null,
+                  backgroundLocation: validation.background_location ?? projectConfig.backgroundLocation ?? null,
+                  fieldMapping: validation.field_mapping ?? projectConfig.fieldMapping ?? null,
+                  layoutPayload: validation.payload ?? projectConfig.layoutPayload ?? null,
+                }
+              : kind === "pit"
+                ? {
+                    ...nextConfigWithDraftHash,
+                    pitLayoutPayload: validation.payload ?? projectConfig.pitLayoutPayload ?? null,
+                  }
+                : nextConfigWithDraftHash;
 
           await invoke("save_project_config", {
             projectId: selectedProject.id,
@@ -2949,6 +3463,14 @@ function App() {
     return timelineEvents.sort((left, right) => left.time - right.time);
   }, [selectedMatchEntry]);
 
+  const selectedMatchQualitativeTextFields = React.useMemo(() => {
+    if (!selectedMatchEntry) {
+      return [] as Array<{ field: string; note: string }>;
+    }
+
+    return extractMatchQualitativeTextFields(selectedMatchEntry);
+  }, [selectedMatchEntry]);
+
   const selectedMatchGeneralQualitativeNotes = React.useMemo(() => {
     if (route.kind !== "match") {
       return [] as Array<{ team: string; scouter: string; notes: Array<{ field: string; note: string }> }>;
@@ -3021,6 +3543,7 @@ function App() {
           fieldMapping={decodeFieldMapping}
           qualitativeContentHash={projectConfig.qualitativeContentHash}
           pitContentHash={projectConfig.pitContentHash}
+          onProjectDataChanged={refreshProjectDataViews}
         />
       </div>
     );
@@ -3069,6 +3592,12 @@ function App() {
               <p className="text-white/75">
                 Project: <span className="font-semibold text-white">{selectedProject.name}</span> • Matches: {selectedTeamMatchCount}
               </p>
+
+              {selectedTeamMatchCount === 0 && selectedStatsTeamHasSupplementalData ? (
+                <div className="rounded-lg border border-amber-300/35 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+                  Match metrics are unavailable for this team until at least one normal match scout is scanned.
+                </div>
+              ) : null}
 
               {isLoadingIndex ? (
                 <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">Loading team stats...</div>
@@ -3398,12 +3927,16 @@ function App() {
                         className="w-full rounded border border-white/10 bg-slate-900/50 p-2 text-left text-xs text-white/75 transition hover:border-blue-400/50 hover:bg-blue-600/10"
                       >
                         <p className="font-semibold text-white">Match {note.match} • {note.scoutType} • {note.scouter}</p>
-                        <p className="mt-1">Good: {highlightSearchTerm(note.good || "—", teamNoteSearch)}</p>
-                        <p>Bad: {highlightSearchTerm(note.bad || "—", teamNoteSearch)}</p>
-                        <p>Area: {highlightSearchTerm(note.area || "—", teamNoteSearch)}</p>
+                        {note.notes.length === 0 ? <p className="mt-1 text-white/65">No qualitative text in match scouting.</p> : null}
+                        {note.notes.map((item, noteIndex) => (
+                          <p key={`team-match-note-${index}-${noteIndex}`} className="mt-1">
+                            <span className="text-white/60">{highlightSearchTerm(item.field, teamNoteSearch)}: </span>
+                            {highlightSearchTerm(item.note, teamNoteSearch)}
+                          </p>
+                        ))}
                       </button>
                     ))}
-                    {filteredSelectedTeamNotes.length === 0 ? <p className="text-xs text-white/50">No match scouter notes found.</p> : null}
+                    {filteredSelectedTeamNotes.length === 0 ? <p className="text-xs text-white/50">No qualitative text found in match scouting for this team.</p> : null}
                   </div>
                 </div>
 
@@ -3421,14 +3954,14 @@ function App() {
                         <p className="font-semibold text-white">Match {row.match} • {row.scouter} • {row.alliance.toUpperCase()} {row.slot.toUpperCase()}</p>
                         {row.notes.map((item, noteIndex) => (
                           <p key={`qual-note-${index}-${noteIndex}`} className="mt-1">
-                            <span className="text-white/60">{item.field}: </span>
+                            <span className="text-white/60">{highlightSearchTerm(item.field, teamQualitativeSearch)}: </span>
                             {highlightSearchTerm(item.note || "—", teamQualitativeSearch)}
                           </p>
                         ))}
                         {row.generalNotes.length > 0 ? <p className="mt-2 text-[11px] uppercase tracking-wide text-white/45">General</p> : null}
                         {row.generalNotes.map((item, noteIndex) => (
                           <p key={`qual-general-${index}-${noteIndex}`}>
-                            <span className="text-white/60">{item.field}: </span>
+                            <span className="text-white/60">{highlightSearchTerm(item.field, teamQualitativeSearch)}: </span>
                             {highlightSearchTerm(item.note || "—", teamQualitativeSearch)}
                           </p>
                         ))}
@@ -3448,13 +3981,97 @@ function App() {
                   />
                   <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
                     {filteredSelectedTeamPitRows.map((row, index) => (
-                      <div key={`pit-team-route-${row.match}-${row.scouter}-${index}`} className="rounded border border-white/10 bg-slate-900/55 p-2 text-xs text-white/80">
-                        <p className="mb-2 font-semibold text-white">Match {row.match} • {row.scouter}</p>
+                      <div key={`pit-team-route-${row.entryIndex}-${row.scouter}-${index}`} className="rounded border border-white/10 bg-slate-900/55 p-2 text-xs text-white/80">
+                        <p className="mb-2 font-semibold text-white">Pit Entry {row.entryIndex + 1} • {row.scouter}</p>
                         <div className="space-y-1">
                           {row.answers.map((answer, answerIndex) => (
-                            <div key={`pit-answer-${index}-${answerIndex}`} className="flex items-start justify-between gap-3 border-b border-white/5 pb-1 last:border-b-0 last:pb-0">
-                              <p className="text-white/65">{answer.questionNumber}. {answer.question}</p>
-                              <p className="max-w-[45%] text-right text-white">{highlightSearchTerm(answer.answerLabel || "—", teamPitSearch)}</p>
+                            <div key={`pit-answer-${index}-${answerIndex}`} className="rounded-md border border-white/10 bg-slate-950/50 p-2">
+                              <p className="text-white/70">{answer.questionNumber}. {highlightSearchTerm(answer.question, teamPitSearch)}</p>
+
+                              {answer.definition?.type === "slider" ? (
+                                <div className="mt-1.5 space-y-1">
+                                  <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
+                                    <div
+                                      className="h-full rounded-full bg-blue-400"
+                                      style={{
+                                        width: `${Math.max(
+                                          0,
+                                          Math.min(
+                                            100,
+                                            (() => {
+                                              const raw =
+                                                typeof answer.answerValue === "number"
+                                                  ? answer.answerValue
+                                                  : typeof answer.answerValue === "string"
+                                                    ? Number(answer.answerValue)
+                                                    : NaN;
+                                              const min = answer.definition?.sliderMin ?? 0;
+                                              const max = answer.definition?.sliderMax ?? 10;
+                                              const span = max - min;
+                                              if (!Number.isFinite(raw) || !Number.isFinite(span) || span <= 0) {
+                                                return 0;
+                                              }
+                                              return ((raw - min) / span) * 100;
+                                            })(),
+                                          ),
+                                        )}%`,
+                                      }}
+                                    />
+                                  </div>
+                                  <div className="flex items-center justify-between text-[11px] text-white/50">
+                                    <span>{answer.definition.sliderLeftText || "Low"} ({answer.definition.sliderMin})</span>
+                                    <span className="text-white">{highlightSearchTerm(answer.answerLabel || "—", teamPitSearch)}</span>
+                                    <span>{answer.definition.sliderRightText || "High"} ({answer.definition.sliderMax})</span>
+                                  </div>
+                                </div>
+                              ) : answer.definition?.type === "multi" ? (
+                                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                                  {Array.isArray(answer.answerValue) && answer.answerValue.length > 0 ? (
+                                    answer.answerValue.map((value, valueIndex) => {
+                                      const numericIndex = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+                                      const label = Number.isInteger(numericIndex) && numericIndex >= 0
+                                        ? answer.definition?.options[numericIndex] ?? String(numericIndex)
+                                        : String(value);
+                                      return (
+                                        <span key={`pit-multi-option-${index}-${answerIndex}-${valueIndex}`} className="rounded-full border border-emerald-300/35 bg-emerald-400/10 px-2 py-0.5 text-[11px] text-emerald-100">
+                                          {highlightSearchTerm(label, teamPitSearch)}
+                                        </span>
+                                      );
+                                    })
+                                  ) : (
+                                    <span className="text-xs text-white/45">None selected</span>
+                                  )}
+                                </div>
+                              ) : answer.definition?.type === "single" ? (
+                                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                                  {(answer.definition?.options ?? []).map((option, optionIndex) => {
+                                    const numericValue =
+                                      typeof answer.answerValue === "number"
+                                        ? answer.answerValue
+                                        : typeof answer.answerValue === "string"
+                                          ? Number(answer.answerValue)
+                                          : NaN;
+                                    const isSelected = Number.isInteger(numericValue) && numericValue === optionIndex;
+                                    return (
+                                      <span
+                                        key={`pit-single-option-${index}-${answerIndex}-${optionIndex}`}
+                                        className={`rounded-full border px-2 py-0.5 text-[11px] ${
+                                          isSelected
+                                            ? "border-blue-300/50 bg-blue-500/20 text-blue-100"
+                                            : "border-white/15 bg-white/5 text-white/55"
+                                        }`}
+                                      >
+                                        {highlightSearchTerm(option, teamPitSearch)}
+                                      </span>
+                                    );
+                                  })}
+                                  {(answer.definition?.options ?? []).length === 0 ? (
+                                    <span className="text-xs text-white/45">{highlightSearchTerm(answer.answerLabel || "—", teamPitSearch)}</span>
+                                  ) : null}
+                                </div>
+                              ) : (
+                                <p className="mt-1.5 rounded bg-white/5 px-2 py-1 text-white">{highlightSearchTerm(answer.answerLabel || "—", teamPitSearch)}</p>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -3474,13 +4091,10 @@ function App() {
 
   if (route.kind === "match") {
     const notesSearch = (matchGeneralSearch || "").trim().toLowerCase();
-    const goodText = typeof selectedMatchEntry?.good === "string" ? selectedMatchEntry.good : "";
-    const badText = typeof selectedMatchEntry?.bad === "string" ? selectedMatchEntry.bad : "";
-    const areaText = typeof selectedMatchEntry?.area === "string" ? selectedMatchEntry.area : "";
-    const noteBlocks = [goodText, badText, areaText].filter((value) => value.trim().length > 0);
-    const noteMatchCount = notesSearch
-      ? noteBlocks.filter((value) => value.toLowerCase().includes(notesSearch)).length
-      : noteBlocks.length;
+    const filteredSelectedMatchQualitativeTextFields = notesSearch
+      ? selectedMatchQualitativeTextFields.filter((item) => `${item.field} ${item.note}`.toLowerCase().includes(notesSearch))
+      : selectedMatchQualitativeTextFields;
+    const noteMatchCount = filteredSelectedMatchQualitativeTextFields.length;
 
     const startPosition = Array.isArray(selectedMatchEntry?.p) ? selectedMatchEntry.p : null;
     const normalizedStartX = startPosition && typeof startPosition[0] === "number" ? Math.min(Math.max(startPosition[0], 0), 1) : null;
@@ -3555,18 +4169,20 @@ function App() {
               <p className="text-xs text-white/60">Matching note blocks: {noteMatchCount}</p>
 
               <div className="space-y-2">
-                <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
-                  <p className="text-xs uppercase text-white/55">Good</p>
-                  <p className="mt-1 text-sm text-white/80">{goodText || "—"}</p>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
-                  <p className="text-xs uppercase text-white/55">Bad</p>
-                  <p className="mt-1 text-sm text-white/80">{badText || "—"}</p>
-                </div>
-                <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
-                  <p className="text-xs uppercase text-white/55">Area</p>
-                  <p className="mt-1 text-sm text-white/80">{areaText || "—"}</p>
-                </div>
+                {filteredSelectedMatchQualitativeTextFields.length === 0 ? (
+                  <div className="rounded-lg border border-white/10 bg-slate-900/50 p-3 text-sm text-white/70">
+                    {selectedMatchQualitativeTextFields.length === 0
+                      ? "No qualitative text fields were captured in match scouting for this record."
+                      : "No qualitative text fields match this search."}
+                  </div>
+                ) : (
+                  filteredSelectedMatchQualitativeTextFields.map((item, index) => (
+                    <div key={`match-note-block-${item.field}-${index}`} className="rounded-lg border border-white/10 bg-slate-900/50 p-3">
+                      <p className="text-xs uppercase text-white/55">{highlightSearchTerm(item.field, matchGeneralSearch)}</p>
+                      <p className="mt-1 text-sm text-white/80">{highlightSearchTerm(item.note, matchGeneralSearch)}</p>
+                    </div>
+                  ))
+                )}
               </div>
 
               <div>
@@ -3595,7 +4211,7 @@ function App() {
                         <p className="font-semibold text-white">Team {row.team} • {row.scouter}</p>
                         {row.notes.map((item, noteIndex) => (
                           <p key={`match-general-note-${index}-${noteIndex}`} className="mt-1">
-                            <span className="text-white/55">{item.field}: </span>
+                            <span className="text-white/55">{highlightSearchTerm(item.field, matchGeneralSearch)}: </span>
                             {highlightSearchTerm(item.note || "—", matchGeneralSearch)}
                           </p>
                         ))}
@@ -3624,6 +4240,10 @@ function App() {
             <Button type="button" variant="outline" className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800" onClick={() => void refreshWorkspace()}>
               <Upload className="mr-2 h-4 w-4" />
               Upload
+            </Button>
+            <Button type="button" variant="outline" className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800" onClick={handleTopNavRefresh}>
+              <RefreshCw className="mr-2 h-4 w-4" />
+              Refresh
             </Button>
           </div>
         </header>
@@ -3713,6 +4333,7 @@ function App() {
                   fieldMapping={decodeFieldMapping}
                   qualitativeContentHash={projectConfig.qualitativeContentHash}
                   pitContentHash={projectConfig.pitContentHash}
+                  onProjectDataChanged={refreshProjectDataViews}
                   embedded
                 />
               </div>
@@ -4153,6 +4774,12 @@ function App() {
                 <h1 className="text-3xl font-semibold tracking-tight">Scouts</h1>
                 <p className="text-white/70">Filter by `scouter` and select a scout.</p>
 
+                {showMissingMatchDataNotice ? (
+                  <div className="rounded-lg border border-amber-300/35 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+                    Showing scouts from qualitative and pit entries. Match statistics appear after at least one normal match scout is scanned.
+                  </div>
+                ) : null}
+
                 <div className="relative max-w-xs">
                   <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
                   <Input
@@ -4168,7 +4795,7 @@ function App() {
                 {isLoadingIndex ? (
                   <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">Loading scouts...</div>
                 ) : filteredScoutNames.length === 0 ? (
-                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">No scouts found from the `scouter` field in this JSON.</div>
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">No scouts found in match, qualitative, or pit data for this project.</div>
                 ) : (
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                     {filteredScoutNames.map((scout) => {
@@ -4190,6 +4817,126 @@ function App() {
                     })}
                   </div>
                 )}
+
+                {selectedScout ? (
+                  <div className="space-y-3 rounded-xl border border-white/10 bg-slate-900/50 p-4">
+                    <p className="text-sm text-white/75">
+                      Scout <span className="font-semibold text-white">{selectedScout}</span> activity
+                    </p>
+
+                    <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+                      <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                        <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Match Scouting ({selectedScoutMatchRows.length})</p>
+                        <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                          {selectedScoutMatchRows.map((row, index) => {
+                            const canOpenTeam = row.team && row.team !== "Unknown";
+                            const canOpenMatch = canOpenTeam && row.match > 0;
+
+                            return (
+                              <button
+                                key={`scout-match-row-${row.team}-${row.match}-${index}`}
+                                type="button"
+                                onClick={() => {
+                                  if (canOpenMatch) {
+                                    navigateMatch(selectedProject.id, row.team, row.match);
+                                    return;
+                                  }
+                                  if (canOpenTeam) {
+                                    navigateTeam(selectedProject.id, row.team);
+                                  }
+                                }}
+                                disabled={!canOpenTeam}
+                                className={`w-full rounded border p-2 text-left text-xs transition ${
+                                  canOpenTeam
+                                    ? "border-white/10 bg-slate-900/50 text-white/80 hover:border-blue-400/50 hover:bg-blue-600/10"
+                                    : "cursor-not-allowed border-white/10 bg-slate-900/40 text-white/40"
+                                }`}
+                              >
+                                <p className="font-semibold text-white">Team {row.team} • Match {row.match || "—"}</p>
+                                {row.notes.length === 0 ? <p className="mt-1 text-white/65">No qualitative text in match scouting.</p> : null}
+                                {row.notes.slice(0, 3).map((item, noteIndex) => (
+                                  <p key={`scout-match-note-${index}-${noteIndex}`} className="mt-1 text-white/65">
+                                    {item.field}: {item.note}
+                                  </p>
+                                ))}
+                              </button>
+                            );
+                          })}
+                          {selectedScoutMatchRows.length === 0 ? <p className="text-xs text-white/50">No match scouting entries.</p> : null}
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                        <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Qualitative Scouting ({selectedScoutQualitativeRows.length})</p>
+                        <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                          {selectedScoutQualitativeRows.map((row, index) => {
+                            const canOpenTeam = row.team && row.team !== "Unknown";
+                            const canOpenMatch = canOpenTeam && row.match > 0;
+
+                            return (
+                              <button
+                                key={`scout-qual-row-${row.team}-${row.match}-${index}`}
+                                type="button"
+                                onClick={() => {
+                                  if (canOpenMatch) {
+                                    navigateMatch(selectedProject.id, row.team, row.match);
+                                    return;
+                                  }
+                                  if (canOpenTeam) {
+                                    navigateTeam(selectedProject.id, row.team);
+                                  }
+                                }}
+                                disabled={!canOpenTeam}
+                                className={`w-full rounded border p-2 text-left text-xs transition ${
+                                  canOpenTeam
+                                    ? "border-white/10 bg-slate-900/50 text-white/80 hover:border-blue-400/50 hover:bg-blue-600/10"
+                                    : "cursor-not-allowed border-white/10 bg-slate-900/40 text-white/40"
+                                }`}
+                              >
+                                <p className="font-semibold text-white">Team {row.team} • Match {row.match || "—"}</p>
+                                <p className="mt-1 text-white/65">{row.alliance ? `${row.alliance.toUpperCase()} ` : ""}{row.slot ? row.slot.toUpperCase() : ""}</p>
+                                <p className="text-white/65">Notes: {row.noteCount} • General: {row.generalCount}</p>
+                              </button>
+                            );
+                          })}
+                          {selectedScoutQualitativeRows.length === 0 ? <p className="text-xs text-white/50">No qualitative scouting entries.</p> : null}
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-white/15 bg-slate-950/70 p-3">
+                        <p className="mb-2 text-xs uppercase tracking-wide text-white/55">Pit Scouting ({selectedScoutPitRows.length})</p>
+                        <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                          {selectedScoutPitRows.map((row) => {
+                            const canOpenTeam = row.team && row.team !== "Unknown";
+
+                            return (
+                              <button
+                                key={`scout-pit-row-${row.entryIndex}-${row.team}`}
+                                type="button"
+                                onClick={() => {
+                                  if (canOpenTeam) {
+                                    navigateTeam(selectedProject.id, row.team);
+                                  }
+                                }}
+                                disabled={!canOpenTeam}
+                                className={`w-full rounded border p-2 text-left text-xs transition ${
+                                  canOpenTeam
+                                    ? "border-white/10 bg-slate-900/50 text-white/80 hover:border-blue-400/50 hover:bg-blue-600/10"
+                                    : "cursor-not-allowed border-white/10 bg-slate-900/40 text-white/40"
+                                }`}
+                              >
+                                <p className="font-semibold text-white">Team {row.team} • Pit Entry {row.entryIndex + 1}</p>
+                                <p className="mt-1 text-white/65">Answered: {row.answerCount} questions</p>
+                                <p className="line-clamp-2 text-white/65">{row.preview || "No answer preview available."}</p>
+                              </button>
+                            );
+                          })}
+                          {selectedScoutPitRows.length === 0 ? <p className="text-xs text-white/50">No pit scouting entries.</p> : null}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ) : projectSection === "data" ? (
               <div className="space-y-4">
@@ -4727,6 +5474,12 @@ function App() {
                 <h1 className="text-3xl font-semibold tracking-tight">Teams</h1>
                 <p className="text-white/70">Filter by the `team` tag and select a team number.</p>
 
+                {showMissingMatchDataNotice ? (
+                  <div className="rounded-lg border border-amber-300/35 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+                    Showing teams from qualitative and pit entries. Match metrics appear after at least one normal match scout is scanned.
+                  </div>
+                ) : null}
+
                 <div className="relative max-w-xs">
                   <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/45" />
                   <Input
@@ -4742,7 +5495,7 @@ function App() {
                 {isLoadingIndex ? (
                   <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">Loading teams...</div>
                 ) : filteredTeamNumbers.length === 0 ? (
-                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">No teams found from the `team` field in this JSON.</div>
+                  <div className="rounded-xl border border-white/10 bg-slate-900/50 px-4 py-6 text-sm text-white/70">No teams found in match, qualitative, or pit data for this project.</div>
                 ) : (
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6">
                     {filteredTeamNumbers.map((team) => {
@@ -4771,6 +5524,10 @@ function App() {
                     <p className="text-sm text-white/75">
                       Team <span className="font-semibold text-white">{selectedTeam}</span> • Matches: {selectedTeamMatchCount}
                     </p>
+
+                    {selectedTeamMatchCount === 0 && selectedStatsTeamHasSupplementalData ? (
+                      <p className="text-sm text-amber-200">Match metrics for this team will appear after at least one normal match scout is scanned.</p>
+                    ) : null}
 
                     {teamAverages.length === 0 ? (
                       <p className="text-sm text-white/60">No numeric tags available for averages.</p>
@@ -4849,6 +5606,10 @@ function App() {
           <Button type="button" variant="outline" className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800" onClick={() => void refreshWorkspace()}>
             <Upload className="mr-2 h-4 w-4" />
             Upload
+          </Button>
+          <Button type="button" variant="outline" className="h-10 rounded-xl border-white/20 bg-slate-900/60 px-5 text-white hover:bg-slate-800" onClick={handleTopNavRefresh}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Refresh
           </Button>
         </div>
       </header>

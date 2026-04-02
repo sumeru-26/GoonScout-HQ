@@ -68,6 +68,7 @@ fn default_project_config() -> serde_json::Value {
         "backgroundImage": null,
         "backgroundLocation": null,
         "fieldMapping": null,
+        "pitLayoutPayload": null,
         "updatedAt": 0
     })
 }
