@@ -688,6 +688,8 @@ function App() {
   const [draggingPickTeam, setDraggingPickTeam] = React.useState<string | null>(null);
   const [isSavingTagPoints, setIsSavingTagPoints] = React.useState(false);
 
+  const autoValidatedHashSignatureByProjectRef = React.useRef(new Map<string, string>());
+
   const [redAllianceTeams, setRedAllianceTeams] = React.useState<[string, string, string]>(["", "", ""]);
   const [blueAllianceTeams, setBlueAllianceTeams] = React.useState<[string, string, string]>(["", "", ""]);
   const [compareScoreMode, setCompareScoreMode] = React.useState<"tag" | "phase">("tag");
@@ -905,6 +907,137 @@ function App() {
       isCancelled = true;
     };
   }, [route.kind, selectedProject]);
+
+  React.useEffect(() => {
+    if ((route.kind !== "project" && route.kind !== "team" && route.kind !== "match") || !selectedProject) {
+      return;
+    }
+
+    const matchHash = (projectConfig.matchContentHash ?? "").trim();
+    const qualitativeHash = (projectConfig.qualitativeContentHash ?? "").trim();
+    const pitHash = (projectConfig.pitContentHash ?? "").trim();
+
+    const signature = `${matchHash}|${qualitativeHash}|${pitHash}`;
+    const previousSignature = autoValidatedHashSignatureByProjectRef.current.get(selectedProject.id);
+    if (previousSignature === signature) {
+      return;
+    }
+
+    if (!matchHash && !qualitativeHash && !pitHash) {
+      autoValidatedHashSignatureByProjectRef.current.set(selectedProject.id, signature);
+      return;
+    }
+
+    // Mark this signature immediately to avoid duplicate concurrent validations.
+    autoValidatedHashSignatureByProjectRef.current.set(selectedProject.id, signature);
+
+    let isCancelled = false;
+
+    const validateAllConfiguredHashes = async () => {
+      try {
+        const issues: string[] = [];
+        const okKinds: string[] = [];
+        let nextConfig = projectConfig;
+
+        if (matchHash) {
+          try {
+            const matchValidation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+              contentHash: matchHash,
+              expectedScoutType: "match",
+            });
+
+            if (!matchValidation.valid || !isScoutingFieldMapping(matchValidation.field_mapping)) {
+              issues.push("match");
+            } else {
+              okKinds.push("match");
+
+              nextConfig = {
+                ...nextConfig,
+                fieldMapping: matchValidation.field_mapping,
+                layoutPayload: matchValidation.payload ?? nextConfig.layoutPayload ?? null,
+                backgroundImage: matchValidation.background_image ?? nextConfig.backgroundImage ?? null,
+                backgroundLocation: matchValidation.background_location ?? nextConfig.backgroundLocation ?? null,
+              };
+            }
+          } catch {
+            issues.push("match");
+          }
+        }
+
+        if (qualitativeHash) {
+          try {
+            const qualitativeValidation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+              contentHash: qualitativeHash,
+              expectedScoutType: "qualitative",
+            });
+
+            if (!qualitativeValidation.valid) {
+              issues.push("qualitative");
+            } else {
+              okKinds.push("qualitative");
+            }
+          } catch {
+            issues.push("qualitative");
+          }
+        }
+
+        if (pitHash) {
+          try {
+            const pitValidation = await invoke<ContentHashValidationResult>("validate_field_config_content_hash", {
+              contentHash: pitHash,
+              expectedScoutType: "pit",
+            });
+
+            if (!pitValidation.valid) {
+              issues.push("pit");
+            } else {
+              okKinds.push("pit");
+              nextConfig = {
+                ...nextConfig,
+                pitLayoutPayload: pitValidation.payload ?? nextConfig.pitLayoutPayload ?? null,
+              };
+            }
+          } catch {
+            issues.push("pit");
+          }
+        }
+
+        if (isCancelled) {
+          return;
+        }
+
+        const configChanged = JSON.stringify(nextConfig) !== JSON.stringify(projectConfig);
+        if (configChanged) {
+          setProjectConfig(nextConfig);
+
+          if (isScoutingFieldMapping(nextConfig.fieldMapping)) {
+            setDecodeFieldMapping(nextConfig.fieldMapping);
+          }
+
+          await invoke("save_project_config", {
+            projectId: selectedProject.id,
+            config: nextConfig,
+          });
+        }
+
+        if (issues.length > 0) {
+          setConfigStatus(`Auto-validated on open with issues: ${issues.join(", ")}.`);
+        } else if (okKinds.length > 0) {
+          setConfigStatus(`Auto-validated on open: ${okKinds.join(", ")}.`);
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setConfigStatus(`Unable to auto-validate hashes on open: ${String(error)}`);
+        }
+      }
+    };
+
+    void validateAllConfiguredHashes();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [projectConfig, route.kind, selectedProject]);
 
   React.useEffect(() => {
     setConfigMatchHashDraft(projectConfig.matchContentHash ?? "");

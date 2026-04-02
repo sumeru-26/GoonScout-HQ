@@ -1300,6 +1300,36 @@ fn create_data_share_code(project_id: String) -> Result<String, String> {
 
     resolve_project_folder(project_id_trimmed)?;
 
+    // Seed newly created share codes with current local project data.
+    let match_entries = ensure_json_array(
+        read_or_init_project_data_file(
+            project_id_trimmed.to_string(),
+            "data.json".into(),
+            serde_json::json!([]),
+        )?,
+        "data.json",
+    )?;
+    let qual_entries = ensure_json_array(
+        read_or_init_project_data_file(
+            project_id_trimmed.to_string(),
+            "qual.json".into(),
+            serde_json::json!([]),
+        )?,
+        "qual.json",
+    )?;
+    let pit_entries = ensure_json_array(
+        read_or_init_project_data_file(
+            project_id_trimmed.to_string(),
+            "pit.json".into(),
+            serde_json::json!([]),
+        )?,
+        "pit.json",
+    )?;
+
+    let match_payload = serde_json::Value::Array(match_entries);
+    let qual_payload = serde_json::Value::Array(qual_entries);
+    let pit_payload = serde_json::Value::Array(pit_entries);
+
     let (supabase_url, supabase_key) = get_supabase_credentials()?;
     let client = Client::new();
 
@@ -1341,9 +1371,9 @@ fn create_data_share_code(project_id: String) -> Result<String, String> {
             .json(&serde_json::json!([
                 {
                     "share_code": candidate,
-                    "match_data": [],
-                    "qual_data": [],
-                    "pit_data": []
+                    "match_data": match_payload.clone(),
+                    "qual_data": qual_payload.clone(),
+                    "pit_data": pit_payload.clone()
                 }
             ]))
             .send()
@@ -1356,6 +1386,39 @@ fn create_data_share_code(project_id: String) -> Result<String, String> {
         let status = insert_response.status();
         let details = insert_response.text().unwrap_or_default();
         let lowered = details.to_lowercase();
+
+        // Backward-compatible fallback for older schemas that use match_json.
+        if lowered.contains("match_data")
+            && (lowered.contains("column") || lowered.contains("schema") || lowered.contains("does not exist"))
+        {
+            let fallback_response = client
+                .post(format!("{}/rest/v1/data_sharing", supabase_url))
+                .header("apikey", supabase_key.as_str())
+                .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+                .header(CONTENT_TYPE, "application/json")
+                .header("Prefer", "return=minimal")
+                .json(&serde_json::json!([
+                    {
+                        "share_code": candidate,
+                        "match_json": match_payload.clone(),
+                        "qual_data": qual_payload.clone(),
+                        "pit_data": pit_payload.clone()
+                    }
+                ]))
+                .send()
+                .map_err(|error| format!("Supabase fallback request failed: {}", error))?;
+
+            if fallback_response.status().is_success() {
+                return Ok(candidate);
+            }
+
+            let fallback_status = fallback_response.status().as_u16();
+            let fallback_details = fallback_response.text().unwrap_or_default();
+            return Err(format!(
+                "Supabase returned HTTP {} while creating share code (fallback). {}",
+                fallback_status, fallback_details
+            ));
+        }
 
         if status.as_u16() == 409 || lowered.contains("duplicate") || lowered.contains("unique") {
             continue;
@@ -1405,7 +1468,9 @@ fn upload_project_share_data(project_id: String, share_code: String) -> Result<D
         supabase_url, normalized_code
     );
 
-    let response = Client::new()
+    let client = Client::new();
+
+    let response = client
         .patch(request_url)
         .header("apikey", supabase_key.as_str())
         .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
@@ -1422,6 +1487,57 @@ fn upload_project_share_data(project_id: String, share_code: String) -> Result<D
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let details = response.text().unwrap_or_default();
+        let lowered = details.to_lowercase();
+
+        // Backward-compatible fallback for older schemas that use match_json.
+        if lowered.contains("match_data")
+            && (lowered.contains("column") || lowered.contains("schema") || lowered.contains("does not exist"))
+        {
+            let fallback_response = client
+                .patch(format!(
+                    "{}/rest/v1/data_sharing?share_code=eq.{}",
+                    supabase_url, normalized_code
+                ))
+                .header("apikey", supabase_key.as_str())
+                .header(AUTHORIZATION, format!("Bearer {}", supabase_key))
+                .header(CONTENT_TYPE, "application/json")
+                .header("Prefer", "return=representation")
+                .json(&serde_json::json!({
+                    "match_json": match_entries,
+                    "qual_data": qual_entries,
+                    "pit_data": pit_entries
+                }))
+                .send()
+                .map_err(|error| format!("Supabase fallback request failed: {}", error))?;
+
+            if !fallback_response.status().is_success() {
+                let fallback_status = fallback_response.status().as_u16();
+                let fallback_details = fallback_response.text().unwrap_or_default();
+                return Err(format!(
+                    "Supabase returned HTTP {} while uploading shared data (fallback). {}",
+                    fallback_status, fallback_details
+                ));
+            }
+
+            let fallback_rows: Vec<serde_json::Value> = fallback_response
+                .json()
+                .map_err(|error| format!("Could not parse Supabase fallback response JSON: {}", error))?;
+
+            if fallback_rows.is_empty() {
+                return Err(format!(
+                    "Share code '{}' was not found. Enter a valid code or create one first.",
+                    normalized_code
+                ));
+            }
+
+            return Ok(DataShareSyncResult {
+                share_code: normalized_code,
+                match_count,
+                qual_count,
+                pit_count,
+            });
+        }
+
         return Err(format!(
             "Supabase returned HTTP {} while uploading shared data. {}",
             status, details
@@ -1458,7 +1574,7 @@ fn download_project_share_data(project_id: String, share_code: String) -> Result
 
     let normalized_code = normalize_share_code(&share_code)?;
     let (supabase_url, supabase_key) = get_supabase_credentials()?;
-    let request_url = build_data_sharing_query_url(&supabase_url, &normalized_code, "match_data,qual_data,pit_data");
+    let request_url = build_data_sharing_query_url(&supabase_url, &normalized_code, "*");
 
     let response = Client::new()
         .get(request_url)
@@ -1491,8 +1607,9 @@ fn download_project_share_data(project_id: String, share_code: String) -> Result
     let match_entries = ensure_json_array(
         row.get("match_data")
             .cloned()
+            .or_else(|| row.get("match_json").cloned())
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-        "match_data",
+        "match_data/match_json",
     )?;
     let qual_entries = ensure_json_array(
         row.get("qual_data")
